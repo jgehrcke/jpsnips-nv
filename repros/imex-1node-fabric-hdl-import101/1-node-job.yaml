@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-repro2
+spec:
+  clusterIP: None
+  selector:
+    job-name: repro2
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: repro2
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        jobname: repro2-worker
+    spec:
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: jobname
+                operator: In
+                values:
+                - repro2-worker
+            topologyKey: nvidia.com/gpu.clique
+          # Run on same node
+          - labelSelector:
+              matchExpressions:
+              - key: jobname
+                operator: In
+                values:
+                - repro2-worker
+            topologyKey: "kubernetes.io/hostname"
+    spec:
+      restartPolicy: Never
+      subdomain: svc-repro2
+      containers:
+      - name: repro2
+        image: docker.io/jgehrcke/fiberrepro:v250324
+        command: ["python", "/thing/fabric-handle-transfer-test.py"]
+        env:
+        - name: LEADER_HTTPD_DNSNAME
+          value: "repro2-0.svc-repro2"
+        - name: LEADER_HTTPD_PORT
+          value: "1337"
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          claims:
+          - name: shared-imex-channel
+      resourceClaims:
+      - name: shared-imex-channel
+        resourceClaimName: repro2-compute-domain-shared-channel
