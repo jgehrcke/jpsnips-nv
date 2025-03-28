@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cd1node
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        jobname: cd1node-worker
+    spec:
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: jobname
+                operator: In
+                values:
+                - cd1node-worker
+            topologyKey: nvidia.com/gpu.clique
+          # Run on same node
+          - labelSelector:
+              matchExpressions:
+              - key: jobname
+                operator: In
+                values:
+                - cd1node-worker
+            topologyKey: "kubernetes.io/hostname"
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: cd1node
+        image: ubuntu:22.04
+        command: ["bash", "-c"]
+        args: ["ls -la /dev/nvidia-caps-imex-channels; trap 'exit 0' TERM; sleep 9999 & wait"]
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          claims:
+          - name: shared-imex-channel
+      resourceClaims:
+      - name: shared-imex-channel
+        resourceClaimName: cd1node-compute-domain-shared-channel
