@@ -1,10 +1,12 @@
 # Cleanup from previous attempt.
 # So one can run `bash 1-node-cd-workaround.sh` repeatedly.
+set -x
 kubectl get resourceclaim
 kubectl get computedomains.resource.nvidia.com
-kubectl delete -f 1-node-cd-workaround.sh
+kubectl delete -f 1-node-cd.yaml
 kubectl delete resourceclaim/cd1node-compute-domain-shared-channel
 kubectl delete computedomains.resource.nvidia.com cd1node-compute-domain
+set +x
 
 # Create ComputeDomain manually.
 cat > cd.yaml <<EOF
@@ -48,10 +50,15 @@ EOF
 kubectl apply -f rc-for-specific-cd.yaml
 
 # Submit 2-pod job, using above's ResourceClaim
-kubectl apply -f 1-node-job.yaml
+kubectl apply -f 1-node-cd.yaml
 
+set -x
+sleep 5
+kubectl wait --for=condition=Ready pods -l batch.kubernetes.io/job-completion-index=0,job-name=cd1node
+kubectl wait --for=condition=Ready pods -l batch.kubernetes.io/job-completion-index=1,job-name=cd1node --timeout=40s
+set +x
 # Inspect pods, and their node placement.
-sleep 10
+
 echo -e "\n\npods on nodes:"
 kubectl get pods -o wide
 
