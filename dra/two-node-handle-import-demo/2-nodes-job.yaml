@@ -1,0 +1,73 @@
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: demo-compute-domain
+spec:
+  numNodes: 2
+  channel:
+    resourceClaimTemplate:
+      name: demo-compute-domain-rct
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-demo
+spec:
+  clusterIP: None
+  selector:
+    job-name: demo
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: demo
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        jobname: demo-worker
+    spec:
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: jobname
+                operator: In
+                values:
+                - demo-worker
+            topologyKey: nvidia.com/gpu.clique
+        # Make pods land on different nodes
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: jobname
+                operator: In
+                values:
+                - demo-worker
+            topologyKey: "kubernetes.io/hostname"
+    spec:
+      restartPolicy: Never
+      subdomain: svc-demo
+      containers:
+      - name: demo
+        image: docker.io/jgehrcke/fiberrepro:v250324
+        command: ["python", "/thing/fabric-handle-transfer-test.py"]
+        env:
+        - name: LEADER_HTTPD_DNSNAME
+          value: "demo-0.svc-demo"
+        - name: LEADER_HTTPD_PORT
+          value: "1337"
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          claims:
+          - name: shared-imex-channel
+      resourceClaims:
+      - name: shared-imex-channel
+        resourceClaimTemplateName: demo-compute-domain-rct
+
