@@ -24,6 +24,7 @@ import requests
 # Show info levels, interleaved with stdout/stderr.
 # Enable timestamps for INFO msgs and higher.
 os.environ["NCCL_DEBUG"] = "INFO"
+# os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["NCCL_DEBUG_TIMESTAMP_LEVELS"] = "WARN,INFO,TRACE"
 os.environ["NCCL_DEBUG_TIMESTAMP_FORMAT"] = "[%F %T.%6f]"
 
@@ -50,7 +51,7 @@ import numpy
 log = logging.getLogger()
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d %(levelname)s: %(message)s",
+    format="%(asctime)s.%(msecs)03d %(levelname)s %(thread)d: %(message)s",
     datefmt="%y%m%d-%H:%M:%S",
 )
 
@@ -67,18 +68,18 @@ if len(sys.argv) > 1:
 
 LARGE_PAYLOAD_DTYPE = numpy.float32  # 64
 LARGE_PAYLOAD_DTYPE_NCCL = nccl.NCCL_FLOAT32  # 64
-LARGE_PAYLOAD_SHAPE = (int(1.5 * 10**_MATRIX_SIZE), int(1.5 * 10**_MATRIX_SIZE))
+LARGE_PAYLOAD_SHAPE = (int(3.5 * 10**_MATRIX_SIZE), int(3.5 * 10**_MATRIX_SIZE))
 LARGE_PAYLOAD_VALUE_COUNT = LARGE_PAYLOAD_SHAPE[0] * LARGE_PAYLOAD_SHAPE[1]
 LARGE_PAYLOAD_BYTES_PER_VALUE = 4
 LARGE_PAYLOAD_SIZE_MB = (LARGE_PAYLOAD_VALUE_COUNT * LARGE_PAYLOAD_BYTES_PER_VALUE) / (
-    1024 * 1024
+    10**6
 )
 
 # At an expected bandwidth of about 700 GB/s pick an amount that will take a
 # small number of seconds to be transmitted.
-SEND_TOTAL_GB_ACROSS_REPETITIONS = 2800
+SEND_TOTAL_GB_ACROSS_REPETITIONS = 2000
 SENDRECV_LOOP_REPETITIONS = int(
-    SEND_TOTAL_GB_ACROSS_REPETITIONS / (LARGE_PAYLOAD_SIZE_MB / 1024.0)
+    SEND_TOTAL_GB_ACROSS_REPETITIONS / (LARGE_PAYLOAD_SIZE_MB / 1000.0)
 )
 
 # Prepare events for synchronization across threads.
@@ -98,7 +99,7 @@ LEADER_HTTPD_BASE_URL = (
 
 
 # Pragmatic distinct type (because cupy isn't typed)
-Matrix = NewType("Matrix", object)
+MatrixBuf = NewType("MatrixBuf", object)
 
 
 def main():
@@ -122,44 +123,6 @@ def main():
     log.info("shutdown")
 
 
-def create_nccl_communicator(n_ranks: int, comms_id, rank: int):
-    with Timer("nccl.NcclCommunicator()"):
-        # This is expected to block until the corresponding call is made by
-        # other jobs: "ncclCommInitRank implicitly synchronizes with other
-        # ranks, hence it must be called by different threads/processes".
-        c = nccl.NcclCommunicator(ndev=n_ranks, commId=comms_id, rank=rank)  # type: ignore
-
-        # The goal of the below code is to wait until the communicator is
-        # ready. As such, "still in progress" might be an expected error. I
-        # have not seen this code catch an "in progress" error yet however.
-        while True:
-            try:
-                c.check_async_error()
-                break
-            except Exception as exc:
-                log.info("communicator not ready, retry. Result: %s", exc)
-            time.sleep(0.5)
-
-    return c
-
-
-def tear_down_communicator(c):
-    log.info("tear down communicator")
-
-    while True:
-        try:
-            c.check_async_error()
-            break
-        except Exception as exc:
-            log.info("communicator not ready, retry. Result: %s", exc)
-        time.sleep(0.5)
-
-    # NCCL communicator teardown. Docs are a little unclear. Let's see.
-    log.info("nccl: comm destroy()")
-    c.destroy()
-    log.info("nccl: comm destroy() returned")
-
-
 def leader(n_ranks: int):
     # From NCCL docs: "Before calling ncclCommInitRank(), you need to first
     # create a unique object which will be used by all processes and threads to
@@ -179,43 +142,54 @@ def leader(n_ranks: int):
     # library obviously and in Python this is exposed as a tuple. That's cool.
     # Just note that this ID is not a string.
     log.info("comms ID type: %s", type(comms_id))
+
+    # Make available process-globally.
     DYNCFG["nccl_comm_id"] = comms_id
 
     # Start the HTTP server for exposing that ID to consumers (start server
     # after ID generation: order is important: don't expose the 'not-set' value
-    # to consumers).
+    # to consumers). Note that this is an implicit barrier for followers: each
+    # follower periodically requests the communication ID and only moves on once
+    # the leader's HTTP server has responded.
     run_httpd_in_thread()
 
-    # for devidx in CUDA_DEVICE_INDICES:
-    # This uses ncclCommInitRank() under the hood which is documented with "Each
-    # rank is associated to a CUDA device, which has to be set before calling
-    # ncclCommInitRank" and with "ncclCommInitRank implicitly synchronizes with
-    # other ranks, hence it must be called by different threads/processes or
-    # used within ncclGroupStart/ncclGroupEnd."
+    # As leader, we make rank 0. Do not explicitly acquire specific CUDA device,
+    # operations below will automatically act on the single device available to
+    # the process. (At some point, I used the context manager `with
+    # cupy.cuda.Device(0) as _:` here but that is not necessary.
+    c = create_nccl_communicator(n_ranks, comms_id, 0)
 
-    # As leader, we make rank 0.
-    with cupy.cuda.Device(0) as _:
-        c = create_nccl_communicator(n_ranks=n_ranks, comms_id=comms_id, rank=0)
-
-        # For reproducibility.
-        cupy.random.set_random_state(
-            cupy.random.RandomState(
-                seed=1, method=cupy.cuda.curand.CURAND_RNG_PSEUDO_DEFAULT
-            )
+    # Specific seed for reproducibility.
+    cupy.random.set_random_state(
+        cupy.random.RandomState(
+            seed=1, method=cupy.cuda.curand.CURAND_RNG_PSEUDO_DEFAULT  # type: ignore
         )
+    )
 
-        with Timer("generate matrix 1"):
-            data, _ = generate_rnd_matrix()
+    # Prepare payload to send (on GPU).
+    with Timer("generate payload matrix"):
+        payload, _ = generate_rnd_matrix()
 
-        # Iterate over all ranks excluding self (0)
+    # All ranks excluding self (0).
+    follower_ranks = list(range(1, n_ranks))
+
+    # Send payload to each follower, sequentially.
+    with Timer("send-matrix-sequentially-to-each-follower"):
         for r in range(1, n_ranks):
-            send_matrix(c, r, data)
+            send_matrix(c, r, payload)
 
     # All followers except for the "last served" are already waiting for this
-    # signal (waiting for us to tell them: ok, shutdown). It seems to be
-    # important to not destroy the NCCL communicator in a follower before the
-    # collective work is done. Otherwise, I have seen the leader hang during
-    # ncclDestroy().
+    # signal (waiting for us to tell them: ok, broadcast benchmark!). Send
+    # payload to all followers, in a single NCCL-provided broadcast operation.
+    sync_with_follower_on_barrier("COLLECTIVE_BROADCAST_BENCHMARK")
+    broadcast_matrix(c, payload, follower_ranks)
+
+    # It seems to be important to not destroy the NCCL communicator in a
+    # follower before the collective work is done. This proceeds in the leader
+    # as soon as the first follower reaches this barrier (doesn't wait
+    # explicitly until _each_ follower reached the barrier, can improve later,
+    # is probably not a problem in practice because all followers are pretty
+    # much synced up here because they left the broadcast at the "same time").
     sync_with_follower_on_barrier("COLLECTIVE_SHUTDOWN")
 
     tear_down_communicator(c)
@@ -230,40 +204,49 @@ def follower(jci, n_ranks: int):
     nccl_communication_id = wait_for_comm_id_from_leader()
 
     # Assume we run in a container that gets precisely one GPU injected.
-    with cupy.cuda.Device(0) as _:
-        c = create_nccl_communicator(
-            n_ranks=n_ranks, comms_id=nccl_communication_id, rank=jci
-        )
+    c = create_nccl_communicator(
+        n_ranks=n_ranks, comms_id=nccl_communication_id, rank=jci
+    )
 
-        # Wait for the on-GPU NCCL communicator logic to have completed.
-        # Calling send() or recv() before that might result in a hang.
-        # I tried doing that with a CUDA event, but that didn't help.
-        log.info("wait 1 second for NCCL communicator setup")
-        time.sleep(1)
-        recv_matrix(c, jci)
+    # All ranks excluding 0.
+    follower_ranks = list(range(1, n_ranks))
+    recvbuf = follower_prepare_gpu_buf()
+
+    # Wait for the on-GPU NCCL communicator logic to have completed.
+    # Calling send() or recv() before that might result in a hang.
+    # I tried doing that with a CUDA event, but that didn't help.
+    log.info("wait 1 second for NCCL communicator setup")
+    time.sleep(1)
+    recv_matrix(c, jci, recvbuf)
+
+    sync_with_leader_on_barrier("COLLECTIVE_BROADCAST_BENCHMARK")
+    broadcast_matrix(c, recvbuf, follower_ranks)
 
     sync_with_leader_on_barrier("COLLECTIVE_SHUTDOWN")
 
     tear_down_communicator(c)
 
 
-def recv_matrix(communicator, jci: int):
-    log.info("recv_matrix: warmup")
-
-    # CUDA context warmup, NCCL warmup
-    # cupy.sum(cupy.random.random((100, 100), dtype=LARGE_PAYLOAD_DTYPE))
-
-    # recvbuf = cupy.zeros(10, dtype=cupy.int64) Note(JP): tried working
-    # with a sparse matrix here but could not get the pointer magic to
-    # work -- it's pointless, since the size of the data is known --
-    # just allocate empty (should be fast, right?). recvbuf =
-    # cupyx.scipy.sparse.coo_matrix(LARGE_PAYLOAD_SHAPE, dtype=LARGE_PAYLOAD_DTYPE)
+def follower_prepare_gpu_buf() -> MatrixBuf:
+    # recvbuf = cupy.zeros(10, dtype=cupy.int64) Note(JP): tried working with a
+    # sparse matrix here but could not get the pointer magic to work -- it's
+    # pointless, since the size of the data is known -- just allocate empty
+    # (should be fast, right?). recvbuf =
+    # cupyx.scipy.sparse.coo_matrix(LARGE_PAYLOAD_SHAPE,
+    # dtype=LARGE_PAYLOAD_DTYPE)
 
     # Documented with "Returns an array without initializing the
     # elements"
     t0 = time.monotonic()
-    recvbuf = cupy.empty(LARGE_PAYLOAD_SHAPE, dtype=LARGE_PAYLOAD_DTYPE)
+    recvbuf = cast(
+        MatrixBuf, cupy.empty(LARGE_PAYLOAD_SHAPE, dtype=LARGE_PAYLOAD_DTYPE)
+    )
     log.info("empty() for recv took %.3f s", time.monotonic() - t0)
+    return recvbuf
+
+
+def recv_matrix(communicator, jci: int, recvbuf: MatrixBuf):
+    log.info("recv_matrix: warmup")
 
     sync_with_leader_on_barrier("WARMUP_EXCHANGE_" + str(jci))
 
@@ -318,10 +301,10 @@ def recv_matrix(communicator, jci: int):
     ev2.synchronize()
     elapsed_s = cupy.cuda.get_elapsed_time(ev1, ev2) / 1000.0
     log.info("recv() loop took overall on GPU: %.3f s", elapsed_s)
-    log_transfer_stats(elapsed_s, f"0 -> {jci}")
+    log_transfer_stats(elapsed_s, f"send-recv-0->{jci}({jci})")
 
 
-def send_matrix(communicator, recv_rank: int, data: Matrix):
+def send_matrix(communicator, recv_rank: int, data: MatrixBuf):
     """
     Work in the context of an acquired GPU device.
     """
@@ -356,14 +339,12 @@ def send_matrix(communicator, recv_rank: int, data: Matrix):
 
     sync_with_follower_on_barrier("BENCHMARK_" + str(recv_rank))
 
-    log.info("send() loop: enter")
     ev1 = cupy.cuda.Event()
     ev2 = cupy.cuda.Event()
-    ev1.record()
-    for i in range(1, SENDRECV_LOOP_REPETITIONS + 1):
-        with Timer(
-            f"communicator.send() to rank {recv_rank}: {i}/{SENDRECV_LOOP_REPETITIONS}"
-        ):
+
+    with Timer(f"send()-to-{recv_rank}: {SENDRECV_LOOP_REPETITIONS} reps"):
+        ev1.record()
+        for _ in range(1, SENDRECV_LOOP_REPETITIONS + 1):
             communicator.send(
                 data.data.ptr,
                 LARGE_PAYLOAD_VALUE_COUNT,
@@ -371,7 +352,8 @@ def send_matrix(communicator, recv_rank: int, data: Matrix):
                 recv_rank,
                 cupy.cuda.Stream.null.ptr,
             )
-    ev2.record()
+        ev2.record()
+
     log.info("send() loop: done (all calls emitted, maybe not yet done on GPU)")
 
     # Block CPU execution until event is recorded (done) on GPU, i.e.
@@ -380,28 +362,92 @@ def send_matrix(communicator, recv_rank: int, data: Matrix):
     ev2.synchronize()
     elapsed_s = cupy.cuda.get_elapsed_time(ev1, ev2) / 1000.0
     log.info("send()-to-%s loop took overall on GPU: %.3f s", recv_rank, elapsed_s)
-    log_transfer_stats(elapsed_s, f"0 -> {recv_rank}")
+    log_transfer_stats(elapsed_s, f"send-recv-0->{recv_rank}(0)")
 
 
-def log_transfer_stats(elapsed_s, descr: str):
-    # Amount of data transferred in GiB, devided by time it took to communicate
-    # in seconds.
-    amount_gib = (
-        (LARGE_PAYLOAD_VALUE_COUNT * LARGE_PAYLOAD_BYTES_PER_VALUE)
-        / (1024 * 1024 * 1024)
-        * SENDRECV_LOOP_REPETITIONS
-    )
+def broadcast_matrix(communicator, payload: MatrixBuf, follower_ranks: list[int]):
+    """
+    Same code called on root rank as receiving ranks.
+    """
+    myrank = communicator.rank_id()
+
     log.info(
-        "%s RESULT data sent: %.3f GiB, time elapsed: %.3f s",
+        "prepare: broadcast matrix 0->ranks(%s) (current rank: %s)",
+        follower_ranks,
+        myrank,
+    )
+
+    # Assume that follower processes are synced up already and jump right into
+    # broadcast().
+
+    ev1 = cupy.cuda.Event()
+    ev2 = cupy.cuda.Event()
+
+    with Timer(f"communicator.broadcast(): {SENDRECV_LOOP_REPETITIONS} reps"):
+        ev1.record()
+        for _ in range(1, SENDRECV_LOOP_REPETITIONS + 1):
+            communicator.broadcast(
+                # sendbuff is only used on rank root and ignored for other ranks.
+                # That is, the sender is where `communicator.rank_id == 0`
+                payload.data.ptr,  # sendbuff
+                # In-place operation will happen if sendbuff == recvbuff.
+                payload.data.ptr,
+                LARGE_PAYLOAD_VALUE_COUNT,
+                LARGE_PAYLOAD_DTYPE_NCCL,
+                # Root (the sender: in this case we for now make this: 0, the
+                # leader).
+                0,
+                # Default stream (I guess)
+                cupy.cuda.Stream.null.ptr,
+            )
+        ev2.record()
+
+    # Block CPU execution until event is recorded (done) on GPU, i.e.
+    # broadcasting is really done.
+    log.info("synchronize with GPU: wait for broadcast() to have completed")
+    ev2.synchronize()
+    elapsed_s = cupy.cuda.get_elapsed_time(ev1, ev2) / 1000.0
+    log.info("broadcast-0-to-%s took overall on GPU: %.3f s", follower_ranks, elapsed_s)
+    log_transfer_stats(
+        elapsed_s,
+        f"broadcast-0->{follower_ranks}({myrank})",
+        broadcast_factor=len(follower_ranks),
+    )
+
+
+def log_transfer_stats(elapsed_s: float, descr: str, broadcast_factor=0):
+    """
+    nvbandwidth measures in GB/s, i.e. actual Giga and not Gibi.
+    See https://github.com/NVIDIA/nvbandwidth/blob/v0.7/memcpy.cpp#L512
+
+    which prepares a `bandwidth` metric in Bytes/s, and then converts to
+    GB/s via `(double)bandwidth * 1e-9`.
+    """
+    # Amount of data transferred in GB, devided by time it took to communicate
+    # in seconds.
+    amount_gib = SENDRECV_LOOP_REPETITIONS * (
+        (LARGE_PAYLOAD_VALUE_COUNT * LARGE_PAYLOAD_BYTES_PER_VALUE)
+        # / (1024 * 1024 * 1024)
+        / (10**9)
+    )
+
+    if broadcast_factor != 0:
+        # There is no right and wrong here. It's certainly interesting to look
+        # at the total amount of data communicated in the system (in an abstract
+        # sense), and use that for a bandwidth calculation.
+        amount_gib = amount_gib * broadcast_factor
+
+    log.info(
+        "%s RESULT data sent: %.3f GB, time elapsed: %.3f s",
         descr,
         amount_gib,
         elapsed_s,
     )
     bandwidth_gib_per_second = amount_gib / elapsed_s
-    log.info("%s RESULT bandwidth: %.3f GiB/s", descr, bandwidth_gib_per_second)
+    log.info("%s RESULT bandwidth: %.3f GB/s", descr, bandwidth_gib_per_second)
 
 
-def generate_rnd_matrix() -> tuple[Matrix, float]:
+def generate_rnd_matrix() -> tuple[MatrixBuf, float]:
     """
     Operate on a GPU, prepare data to send. The `data` return value references
     that data (potentially a large payload residing in GPU memory).
@@ -412,7 +458,7 @@ def generate_rnd_matrix() -> tuple[Matrix, float]:
     # shows, expectedly, 39232MiB.
 
     log.info(
-        "generate rnd matrix, shape: %s, dtype: %s, (size: %.3f MB)",
+        "generate rnd matrix: shape: %s, dtype: %s, (size: %.3f MB)",
         LARGE_PAYLOAD_SHAPE,
         LARGE_PAYLOAD_DTYPE,
         LARGE_PAYLOAD_SIZE_MB,
@@ -422,7 +468,7 @@ def generate_rnd_matrix() -> tuple[Matrix, float]:
     # cupy was indicating or not indicating (lots of Unknown).
     t0 = time.monotonic()
     data = cast(
-        Matrix, cupy.random.random(LARGE_PAYLOAD_SHAPE, dtype=LARGE_PAYLOAD_DTYPE)
+        MatrixBuf, cupy.random.random(LARGE_PAYLOAD_SHAPE, dtype=LARGE_PAYLOAD_DTYPE)
     )
     t1 = time.monotonic()
     checksum = cast(float, cupy.sum(data))
@@ -431,13 +477,52 @@ def generate_rnd_matrix() -> tuple[Matrix, float]:
     # Note that below's timings might be flawed because this is CPU land
     # perspective. Proper timing can be done with CUDA events.
     log.info(
-        "durations: rndgen: %.3f s, sum: %.3f s",
+        "generate rnd matrix: durations: rndgen: %.3f s, sum: %.3f s",
         t1 - t0,
         t2 - t1,
     )
-    log.info("matrix checksum: %s", checksum)
+    log.info("generate rnd matrix: checksum: %s", checksum)
 
     return data, checksum
+
+
+def create_nccl_communicator(n_ranks: int, comms_id, rank: int):
+    with Timer("nccl.NcclCommunicator()"):
+        # Note: uses ncclCommInitRank() under the hood. Expected to block until
+        # the corresponding call is made by other jobs: "ncclCommInitRank
+        # implicitly synchronizes with other ranks, hence it must be called by
+        # different threads/processes".
+        c = nccl.NcclCommunicator(ndev=n_ranks, commId=comms_id, rank=rank)  # type: ignore
+
+        # The goal of the below code is to wait until the communicator is
+        # ready. As such, "still in progress" might be an expected error. I
+        # have not seen this code catch an "in progress" error yet however.
+        while True:
+            try:
+                c.check_async_error()
+                break
+            except Exception as exc:
+                log.info("communicator not ready, retry. Result: %s", exc)
+            time.sleep(0.5)
+
+    return c
+
+
+def tear_down_communicator(c):
+    log.info("tear down communicator")
+
+    while True:
+        try:
+            c.check_async_error()
+            break
+        except Exception as exc:
+            log.info("communicator not ready, retry. Result: %s", exc)
+        time.sleep(0.5)
+
+    # NCCL communicator teardown. Docs are a little unclear. Let's see.
+    log.info("nccl: comm destroy()")
+    c.destroy()
+    log.info("nccl: comm destroy() returned")
 
 
 def sync_with_follower_on_barrier(bname: str):
@@ -544,7 +629,8 @@ class HTTPHandler(BaseHTTPRequestHandler):
             # The ID is a tuple. For safe transfer: encode to byte string.
             comms_id_serialized = pickle.dumps(DYNCFG["nccl_comm_id"])
             log.info(
-                "HTTPD: send serialized NCCL communication ID: %s", comms_id_serialized
+                "HTTPD: send serialized NCCL communication ID: %s...",
+                comms_id_serialized[:6],
             )
             message = comms_id_serialized + b"\n"
 
@@ -591,7 +677,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(message)
-        log.info("served request to %s", self.path)
+        log.debug("served request to %s", self.path)
         return
 
 
@@ -610,7 +696,8 @@ def run_httpd_in_thread():
         s.serve_forever()
 
     # Start main loop of this server in its own thread.
-    t = threading.Thread(target=run)
+    # Set name, used in logger.
+    t = threading.Thread(target=run, name="httpd")
 
     # Program exits when only daemon threads are left (no explicit join
     # required in this case).
@@ -682,6 +769,12 @@ def log_debug_info_assert_env():
     except Exception as exc:
         log.info("cannot inspect /proc/devices: %s", exc)
 
+    dinfo_path = "/proc/driver/nvidia/version"
+    try:
+        log.info("%s: %s", dinfo_path, open(dinfo_path, "rb").read().decode("utf-8"))
+    except Exception as exc:
+        log.info("cannot inspect /proc/devices: %s", exc)
+
     # For simplicity, towards single-GPU-per-container
     assert devcount == 1, "precisely one CUDA device expected"
 
@@ -739,6 +832,9 @@ if sys.argv[1] == "handle_signal":
 
 
 if __name__ == "__main__":
+    # Set name for logging, same length as 'httpd'
+    threading.current_thread().name = " main"
+
     # Always have exit code 0 to not have the k8s job restart pods
     try:
         main()
