@@ -1,0 +1,83 @@
+---
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: nickelpie-test-compute-domain
+spec:
+  numNodes: ${NICKELPIE_N_RANKS}
+  channel:
+    resourceClaimTemplate:
+      name: nickelpie-test-compute-domain-channel
+---
+# For pod-to-pod-in-job communication: headless service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-nickelpie
+spec:
+  clusterIP: None # clusterIP must be None to create a headless service
+  selector:
+    job-name: nickelpie-test # must match Job name
+  ports:
+    - protocol: TCP
+      port: 1337
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nickelpie-test
+spec:
+  completions: ${NICKELPIE_N_RANKS}
+  parallelism: ${NICKELPIE_N_RANKS}
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        nickelpie-test-replica: nickelpie-worker
+    spec:
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: nickelpie-test-replica
+                operator: In
+                values:
+                - nickelpie-worker
+            # Require NVLink-linkage.
+            topologyKey: nvidia.com/gpu.clique
+        # Make pods land on different nodes
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: nickelpie-test-replica
+                operator: In
+                values:
+                - nickelpie-worker
+            topologyKey: "kubernetes.io/hostname"
+    spec:
+      restartPolicy: Never
+      subdomain: svc-nickelpie  # has to match service name
+      containers:
+      - name: nickelpie-test
+        image: docker.io/jgehrcke/nickelpie:latest
+        command: ["python3", "/thing/nickelpie.py", "4"]
+        env:
+        - name: NICKELPIE_RANKS
+          value: "${NICKELPIE_N_RANKS}"
+        - name: NICKELPIE_HTTPD_DNSNAME
+          value: "nickelpie-test-0.svc-nickelpie"
+        - name: NICKELPIE_HTTPD_PORT
+          value: "1337"
+        ports:
+        - containerPort: 1337
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          claims:
+          - name: compute-domain-channel
+      resourceClaims:
+      - name: compute-domain-channel
+        resourceClaimTemplateName: nickelpie-test-compute-domain-channel
