@@ -1,0 +1,748 @@
+import logging
+import uuid
+import time
+import sys
+import os
+import signal
+import threading
+import pickle
+
+from typing import NewType, cast
+
+
+from datetime import datetime
+
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+from pprint import pformat
+
+import requests
+
+# Note(JP): nccl provides excellent log output, revealing much of what it's
+# doing under the hood (great for understanding), but also seemingly pretty good
+# error messages.
+# Show info levels, interleaved with stdout/stderr.
+# Enable timestamps for INFO msgs and higher.
+os.environ["NCCL_DEBUG"] = "INFO"
+os.environ["NCCL_DEBUG_TIMESTAMP_LEVELS"] = "WARN,INFO,TRACE"
+os.environ["NCCL_DEBUG_TIMESTAMP_FORMAT"] = "[%F %T.%6f]"
+
+
+if "NCCL_MNNVL_ENABLE" not in os.environ:
+    # If set externally this takes precedence. Note: when set to 1 things still
+    # don't fail when MNNVL isn't available, there seems to be graceful
+    # degradation after showing an error message.
+    # os.environ["NCCL_MNNVL_ENABLE"] = "0"
+    # just for fun
+    # os.environ["NCCL_P2P_DISABLE"] = "1"
+    ...
+
+
+import cupy
+from cupy.cuda import nccl
+import numpy
+
+# NVIDIA's python bindings for the CUDA API.
+# https://github.com/NVIDIA/cuda-python
+# import cuda
+# from cuda.bindings import driver, runtime, nvrtc
+
+log = logging.getLogger()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d %(levelname)s: %(message)s",
+    datefmt="%y%m%d-%H:%M:%S",
+)
+
+# global dictionary, thread-safe updates
+DYNCFG = {"nccl_comm_id": "not-set"}
+
+_MATRIX_SIZE = 3
+if len(sys.argv) > 1:
+    try:
+        _MATRIX_SIZE = int(sys.argv[1])
+    except ValueError:
+        pass
+
+
+LARGE_PAYLOAD_DTYPE = numpy.float32  # 64
+LARGE_PAYLOAD_DTYPE_NCCL = nccl.NCCL_FLOAT32  # 64
+LARGE_PAYLOAD_SHAPE = (int(1.5 * 10**_MATRIX_SIZE), int(1.5 * 10**_MATRIX_SIZE))
+LARGE_PAYLOAD_VALUE_COUNT = LARGE_PAYLOAD_SHAPE[0] * LARGE_PAYLOAD_SHAPE[1]
+LARGE_PAYLOAD_BYTES_PER_VALUE = 4
+LARGE_PAYLOAD_SIZE_MB = (LARGE_PAYLOAD_VALUE_COUNT * LARGE_PAYLOAD_BYTES_PER_VALUE) / (
+    1024 * 1024
+)
+
+# At an expected bandwidth of about 700 GB/s pick an amount that will take a
+# small number of seconds to be transmitted.
+SEND_TOTAL_GB_ACROSS_REPETITIONS = 2800
+SENDRECV_LOOP_REPETITIONS = int(
+    SEND_TOTAL_GB_ACROSS_REPETITIONS / (LARGE_PAYLOAD_SIZE_MB / 1024.0)
+)
+
+# Prepare events for synchronization across threads.
+# _barriers = ["COMMUNICATOR_SETUP", "WARMUP_EXCHANGE", "BENCHMARK"]
+EVENTS = {}
+# for _b in _barriers:
+#     EVENTS["BARRIER_FOLLOWER_" + _b] = threading.Event()
+#     EVENTS["BARRIER_LEADER_" + _b] = threading.Event()
+
+
+LEADER_HTTPD_BASE_URL = (
+    "http://"
+    + os.environ["NICKELPIE_HTTPD_DNSNAME"]
+    + ":"
+    + os.environ["NICKELPIE_HTTPD_PORT"]
+)
+
+
+# Pragmatic distinct type (because cupy isn't typed)
+Matrix = NewType("Matrix", object)
+
+
+def main():
+    log_debug_info_assert_env()
+
+    n_ranks = int(os.environ["NICKELPIE_RANKS"])
+    jci = int(os.environ["JOB_COMPLETION_INDEX"])
+    log.info("k8s job completion index: %s", jci)
+
+    if jci == 0:
+        leader(n_ranks)
+
+    else:
+        follower(jci, n_ranks)
+
+    # Not yet sure if I tear down NCCL properly, wait for more logs to appear.
+    # for _ in range(1200):
+    #     time.sleep(30)
+    #     log.info("wait")
+
+    log.info("shutdown")
+
+
+def create_nccl_communicator(n_ranks: int, comms_id, rank: int):
+    with Timer("nccl.NcclCommunicator()"):
+        # This is expected to block until the corresponding call is made by
+        # other jobs: "ncclCommInitRank implicitly synchronizes with other
+        # ranks, hence it must be called by different threads/processes".
+        c = nccl.NcclCommunicator(ndev=n_ranks, commId=comms_id, rank=rank)  # type: ignore
+
+        # The goal of the below code is to wait until the communicator is
+        # ready. As such, "still in progress" might be an expected error. I
+        # have not seen this code catch an "in progress" error yet however.
+        while True:
+            try:
+                c.check_async_error()
+                break
+            except Exception as exc:
+                log.info("communicator not ready, retry. Result: %s", exc)
+            time.sleep(0.5)
+
+    return c
+
+
+def tear_down_communicator(c):
+    log.info("tear down communicator")
+
+    while True:
+        try:
+            c.check_async_error()
+            break
+        except Exception as exc:
+            log.info("communicator not ready, retry. Result: %s", exc)
+        time.sleep(0.5)
+
+    # NCCL communicator teardown. Docs are a little unclear. Let's see.
+    log.info("nccl: comm destroy()")
+    c.destroy()
+    log.info("nccl: comm destroy() returned")
+
+
+def leader(n_ranks: int):
+    # From NCCL docs: "Before calling ncclCommInitRank(), you need to first
+    # create a unique object which will be used by all processes and threads to
+    # synchronize and understand they are part of the same communicator. This is
+    # done by calling the ncclGetUniqueId() function. The ncclGetUniqueId()
+    # function returns an ID which has to be broadcast to all participating
+    # threads and processes using any CPU communication system, for example,
+    # passing the ID pointer to multiple threads, or broadcasting it to other
+    # processes using MPI or another parallel environment using, for example,
+    # sockets."
+    comms_id = nccl.get_unique_id()
+
+    log.info("generated NCCL commnication ID: %s", comms_id)
+
+    # The communication ID is what needs to be generated once and then shared
+    # with all communicating peers. This value is generated by the NCCL C
+    # library obviously and in Python this is exposed as a tuple. That's cool.
+    # Just note that this ID is not a string.
+    log.info("comms ID type: %s", type(comms_id))
+    DYNCFG["nccl_comm_id"] = comms_id
+
+    # Start the HTTP server for exposing that ID to consumers (start server
+    # after ID generation: order is important: don't expose the 'not-set' value
+    # to consumers).
+    run_httpd_in_thread()
+
+    # for devidx in CUDA_DEVICE_INDICES:
+    # This uses ncclCommInitRank() under the hood which is documented with "Each
+    # rank is associated to a CUDA device, which has to be set before calling
+    # ncclCommInitRank" and with "ncclCommInitRank implicitly synchronizes with
+    # other ranks, hence it must be called by different threads/processes or
+    # used within ncclGroupStart/ncclGroupEnd."
+
+    # As leader, we make rank 0.
+    with cupy.cuda.Device(0) as _:
+        c = create_nccl_communicator(n_ranks=n_ranks, comms_id=comms_id, rank=0)
+
+        # For reproducibility.
+        cupy.random.set_random_state(
+            cupy.random.RandomState(
+                seed=1, method=cupy.cuda.curand.CURAND_RNG_PSEUDO_DEFAULT
+            )
+        )
+
+        with Timer("generate matrix 1"):
+            data, _ = generate_rnd_matrix()
+
+        # Iterate over all ranks excluding self (0)
+        for r in range(1, n_ranks):
+            send_matrix(c, r, data)
+
+    # All followers except for the "last served" are already waiting for this
+    # signal (waiting for us to tell them: ok, shutdown). It seems to be
+    # important to not destroy the NCCL communicator in a follower before the
+    # collective work is done. Otherwise, I have seen the leader hang during
+    # ncclDestroy().
+    sync_with_follower_on_barrier("COLLECTIVE_SHUTDOWN")
+
+    tear_down_communicator(c)
+    log.info("done: sending")
+
+
+def follower(jci, n_ranks: int):
+    """
+    jci: Job completion index, injected by k8s. Is at least 1. We're a follower
+    (leader is 0). This translates to 'rank'.
+    """
+    nccl_communication_id = wait_for_comm_id_from_leader()
+
+    # Assume we run in a container that gets precisely one GPU injected.
+    with cupy.cuda.Device(0) as _:
+        c = create_nccl_communicator(
+            n_ranks=n_ranks, comms_id=nccl_communication_id, rank=jci
+        )
+
+        # Wait for the on-GPU NCCL communicator logic to have completed.
+        # Calling send() or recv() before that might result in a hang.
+        # I tried doing that with a CUDA event, but that didn't help.
+        log.info("wait 1 second for NCCL communicator setup")
+        time.sleep(1)
+        recv_matrix(c, jci)
+
+    sync_with_leader_on_barrier("COLLECTIVE_SHUTDOWN")
+
+    tear_down_communicator(c)
+
+
+def recv_matrix(communicator, jci: int):
+    log.info("recv_matrix: warmup")
+
+    # CUDA context warmup, NCCL warmup
+    # cupy.sum(cupy.random.random((100, 100), dtype=LARGE_PAYLOAD_DTYPE))
+
+    # recvbuf = cupy.zeros(10, dtype=cupy.int64) Note(JP): tried working
+    # with a sparse matrix here but could not get the pointer magic to
+    # work -- it's pointless, since the size of the data is known --
+    # just allocate empty (should be fast, right?). recvbuf =
+    # cupyx.scipy.sparse.coo_matrix(LARGE_PAYLOAD_SHAPE, dtype=LARGE_PAYLOAD_DTYPE)
+
+    # Documented with "Returns an array without initializing the
+    # elements"
+    t0 = time.monotonic()
+    recvbuf = cupy.empty(LARGE_PAYLOAD_SHAPE, dtype=LARGE_PAYLOAD_DTYPE)
+    log.info("empty() for recv took %.3f s", time.monotonic() - t0)
+
+    sync_with_leader_on_barrier("WARMUP_EXCHANGE_" + str(jci))
+
+    # Receive warmup matrix.
+    ev1 = cupy.cuda.Event()
+    ev2 = cupy.cuda.Event()
+    with Timer(f"communicator.recv() warumup"):
+        ev1.record()
+        communicator.recv(
+            recvbuf.data.ptr,
+            LARGE_PAYLOAD_VALUE_COUNT,
+            LARGE_PAYLOAD_DTYPE_NCCL,
+            0,
+            cupy.cuda.Stream.null.ptr,
+        )
+        ev2.record()
+
+    log.info("synchronize with GPU: wait for last recv() to have completed")
+    ev2.synchronize()
+    log.info(
+        "warmup: recv() blocked GPU for %.5f s",
+        cupy.cuda.get_elapsed_time(ev1, ev2) / 1000.0,
+    )
+
+    # Before entering the timed recv() loop make sure that the leader enters its
+    # send() loop at pretty much the same time.
+    sync_with_leader_on_barrier("BENCHMARK_" + str(jci))
+
+    log.info("recv() loop: enter")
+    ev1 = cupy.cuda.Event()
+    ev2 = cupy.cuda.Event()
+    ev1.record()
+    for i in range(1, SENDRECV_LOOP_REPETITIONS + 1):
+        with Timer(f"communicator.recv() {i}/{SENDRECV_LOOP_REPETITIONS}"):
+            communicator.recv(
+                recvbuf.data.ptr,
+                LARGE_PAYLOAD_VALUE_COUNT,
+                LARGE_PAYLOAD_DTYPE_NCCL,
+                0,
+                cupy.cuda.Stream.null.ptr,
+            )
+        # For now, just receive and don't look at the data. Looking is required
+        # for checksum verification. But that takes time and distracts from
+        # bandwidth measurement.
+        # log.info("recvbuf checksum: %s", cupy.sum(recvbuf))
+    ev2.record()
+    log.info("recv() loop: done (all calls emitted, maybe not yet done on GPU)")
+
+    # Block CPU execution until event is recorded (done) on GPU, i.e. receiving
+    # is really done.
+    log.info("synchronize with GPU: wait for last recv() to have completed")
+    ev2.synchronize()
+    elapsed_s = cupy.cuda.get_elapsed_time(ev1, ev2) / 1000.0
+    log.info("recv() loop took overall on GPU: %.3f s", elapsed_s)
+    log_transfer_stats(elapsed_s, f"0 -> {jci}")
+
+
+def send_matrix(communicator, recv_rank: int, data: Matrix):
+    """
+    Work in the context of an acquired GPU device.
+    """
+    log.info("prepare: send matrix to rank %s", recv_rank)
+
+    sync_with_follower_on_barrier("WARMUP_EXCHANGE_" + str(recv_rank))
+
+    # A complete warmup send()/recv() for CUDA, NCCL.
+
+    # Call send(). This is blocking on the GPU (stream) until a corresponding
+    # recv() call is made. Use CUDA events to measure exactly how long this
+    # blocks the stream (this likely executes on the default stream (0)).
+    ev1 = cupy.cuda.Event()
+    ev2 = cupy.cuda.Event()
+    with Timer(f"communicator.send() to rank {recv_rank}: warumup"):
+        ev1.record()
+        communicator.send(
+            data.data.ptr,
+            LARGE_PAYLOAD_VALUE_COUNT,
+            LARGE_PAYLOAD_DTYPE_NCCL,
+            recv_rank,
+            cupy.cuda.Stream.null.ptr,
+        )
+        ev2.record()
+
+    log.info("synchronize with GPU: wait for last send() to have completed")
+    ev2.synchronize()
+    log.info(
+        "warmup: send() blocked GPU for %.5f s",
+        cupy.cuda.get_elapsed_time(ev1, ev2) / 1000.0,
+    )
+
+    sync_with_follower_on_barrier("BENCHMARK_" + str(recv_rank))
+
+    log.info("send() loop: enter")
+    ev1 = cupy.cuda.Event()
+    ev2 = cupy.cuda.Event()
+    ev1.record()
+    for i in range(1, SENDRECV_LOOP_REPETITIONS + 1):
+        with Timer(
+            f"communicator.send() to rank {recv_rank}: {i}/{SENDRECV_LOOP_REPETITIONS}"
+        ):
+            communicator.send(
+                data.data.ptr,
+                LARGE_PAYLOAD_VALUE_COUNT,
+                LARGE_PAYLOAD_DTYPE_NCCL,
+                recv_rank,
+                cupy.cuda.Stream.null.ptr,
+            )
+    ev2.record()
+    log.info("send() loop: done (all calls emitted, maybe not yet done on GPU)")
+
+    # Block CPU execution until event is recorded (done) on GPU, i.e.
+    # sending is really done.
+    log.info("synchronize with GPU: wait for last send() to have completed")
+    ev2.synchronize()
+    elapsed_s = cupy.cuda.get_elapsed_time(ev1, ev2) / 1000.0
+    log.info("send()-to-%s loop took overall on GPU: %.3f s", recv_rank, elapsed_s)
+    log_transfer_stats(elapsed_s, f"0 -> {recv_rank}")
+
+
+def log_transfer_stats(elapsed_s, descr: str):
+    # Amount of data transferred in GiB, devided by time it took to communicate
+    # in seconds.
+    amount_gib = (
+        (LARGE_PAYLOAD_VALUE_COUNT * LARGE_PAYLOAD_BYTES_PER_VALUE)
+        / (1024 * 1024 * 1024)
+        * SENDRECV_LOOP_REPETITIONS
+    )
+    log.info(
+        "%s RESULT data sent: %.3f GiB, time elapsed: %.3f s",
+        descr,
+        amount_gib,
+        elapsed_s,
+    )
+    bandwidth_gib_per_second = amount_gib / elapsed_s
+    log.info("%s RESULT bandwidth: %.3f GiB/s", descr, bandwidth_gib_per_second)
+
+
+def generate_rnd_matrix() -> tuple[Matrix, float]:
+    """
+    Operate on a GPU, prepare data to send. The `data` return value references
+    that data (potentially a large payload residing in GPU memory).
+    """
+    # Generate 2D arr (matrix) for sending. msize=5 means: 10^10 values,
+    # i.e. 10 billion values. Each value being four bytes (32 bit
+    # float). Overall, that's about 40 GB of memory expected. nvidia-smi
+    # shows, expectedly, 39232MiB.
+
+    log.info(
+        "generate rnd matrix, shape: %s, dtype: %s, (size: %.3f MB)",
+        LARGE_PAYLOAD_SHAPE,
+        LARGE_PAYLOAD_DTYPE,
+        LARGE_PAYLOAD_SIZE_MB,
+    )
+
+    # Note(JP): I resorted to using `cast` to reliably override whatever types
+    # cupy was indicating or not indicating (lots of Unknown).
+    t0 = time.monotonic()
+    data = cast(
+        Matrix, cupy.random.random(LARGE_PAYLOAD_SHAPE, dtype=LARGE_PAYLOAD_DTYPE)
+    )
+    t1 = time.monotonic()
+    checksum = cast(float, cupy.sum(data))
+    t2 = time.monotonic()
+
+    # Note that below's timings might be flawed because this is CPU land
+    # perspective. Proper timing can be done with CUDA events.
+    log.info(
+        "durations: rndgen: %.3f s, sum: %.3f s",
+        t1 - t0,
+        t2 - t1,
+    )
+    log.info("matrix checksum: %s", checksum)
+
+    return data, checksum
+
+
+def sync_with_follower_on_barrier(bname: str):
+    """
+    Signal to the HTTP server (running in another thread) that it can tell the
+    follower that we've reached this barrier, and that we're ready to move past
+    it.
+    """
+    enames = ("BARRIER_LEADER_" + bname, "BARRIER_FOLLOWER_" + bname)
+    for name in enames:
+        # Set value if not already present. Atomic (thread-safe).
+        EVENTS.setdefault(name, threading.Event())
+
+    # Inform the HTTP handler that it's allowed to respond _now_.
+    EVENTS["BARRIER_LEADER_" + bname].set()
+
+    # Wait for the follower to have told us (via HTTP) that it also has reached
+    # the barrier.
+    log.info("sync: wait until follower reached barrier %s", bname)
+    EVENTS["BARRIER_FOLLOWER_" + bname].wait()
+
+    log.info("sync: follower reached barrier %s -- move on", bname)
+
+
+def sync_with_leader_on_barrier(bname) -> None:
+    """
+    Implement two-way handshake between leader and follower.
+
+    Send request to /ready-to-recv endpoint, indicating to the leader that we
+    are ready to enter the recv() loop.
+
+    Block on receiving a response from the leader.
+
+    Once a response arrives we know that the leader is ready to enter the send
+    loop.
+
+    That allows for both of us to enter the recv()-send()-loop at approximately
+    the same wall time and that makes for a useful overall measurement of
+    completion time, where the total time spent in the recv() loop (recipient
+    point of view) or send() loop (sender point of view) corresponds to
+    approximately the total time spent in communication. That is highly relevant
+    for more or less meaningful bandwidth measurement.
+    """
+    url = f"{LEADER_HTTPD_BASE_URL}/sync-on-" + bname
+
+    log.info("send request to %s and wait for resp", url)
+    while True:
+        try:
+            # Short connect() timeout, but long recv() timeout to implement sync
+            # barrier.
+            resp = requests.get(url, timeout=(4, 300))
+            break
+        except requests.exceptions.RequestException as exc:
+            log.info("request failed, retry soon -- err was: %s", exc)
+            time.sleep(1)
+
+    log.info("reached leader, got resp body: %s", resp.content)
+    assert resp.text == "move"
+
+
+def wait_for_comm_id_from_leader() -> tuple:
+    """
+    Wait until HTTP server becomes reachable, and read NCCL communication ID
+    from leader. Return it.
+    """
+
+    url = f"{LEADER_HTTPD_BASE_URL}/communication-id"
+
+    log.info("enter loop: get NCCL communication ID from leader, URL: %s", url)
+    while True:
+        try:
+            # Short connect()/recv() timeout to keep logs flowing.
+            resp = requests.get(url, timeout=(4, 6))
+            if resp.status_code == 200:
+                break
+            log.info(
+                "unexpected response, retry: %s, %s",
+                resp.status_code,
+                resp.content[:200],
+            )
+        except requests.exceptions.RequestException as exc:
+            # dns err, connect or recv timeout, etc
+            log.info("request failed, retry soon -- err was: %s", exc)
+        time.sleep(0.5)
+
+    log.info("leader, got resp body (hex prefix): %s...", resp.content[:5].hex())
+
+    # Pickle-decode communication ID, it's originally a Python tuple.
+    nccl_communication_id = pickle.loads(resp.content)
+    log.info("NCCL communication ID: %s", nccl_communication_id)
+    assert isinstance(nccl_communication_id, tuple)
+
+    return nccl_communication_id
+
+
+class HTTPHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # Handles any GET (any path)
+
+        message = b"unknown path"
+
+        # poor-person's by-path handler:
+        if "/communication-id" in self.path:
+            # The ID is a tuple. For safe transfer: encode to byte string.
+            comms_id_serialized = pickle.dumps(DYNCFG["nccl_comm_id"])
+            log.info(
+                "HTTPD: send serialized NCCL communication ID: %s", comms_id_serialized
+            )
+            message = comms_id_serialized + b"\n"
+
+        if "/sync-on-" in self.path:
+            # The follower came here to signal us that they are ready to move
+            # past a named barrier. Are we ready to move past that, however?
+            # Block until we our sender thread is indicating so, and delay
+            # sending the HTTP response out to the client (it has a ~long recv()
+            # timout set).
+
+            barrier_name = self.path.split("sync-on-")[1]
+            log.info(
+                "HTTPD: follower reached barrier %s, block emitting response until leader ready",
+                barrier_name,
+            )
+
+            # Set value of not already present. Atomic (thread-safe). This means
+            # a bad HTTP client can create such event objects. That's OK for
+            # now. I just don't want to pre-create all events (requires a priori
+            # known names of all barriers), but instead write barrier names only
+            # in the call sites.
+            enames = (
+                "BARRIER_FOLLOWER_" + barrier_name,
+                "BARRIER_LEADER_" + barrier_name,
+            )
+            for name in enames:
+                EVENTS.setdefault(name, threading.Event())
+
+            follower_ready = EVENTS["BARRIER_FOLLOWER_" + barrier_name]
+            leader_ready = EVENTS["BARRIER_LEADER_" + barrier_name]
+
+            # Block until sender thread sets this. Might already be unblocked.
+            leader_ready.wait()
+
+            log.info(
+                "HTTPD: leader reached barrier %s. Notify follower to move past this (via HTTP response)",
+                barrier_name,
+            )
+
+            # Notify sender thread that indeed now it's supposed to enter the send loop.
+            follower_ready.set()
+            message = b"move"
+
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(message)
+        log.info("served request to %s", self.path)
+        return
+
+
+def run_httpd_in_thread():
+    def run():
+        log.info("start HTTP server")
+
+        # Handle each incoming request in its own thread.
+        s = ThreadingHTTPServer(
+            # Listen on all interfaces.
+            ("0.0.0.0", int(os.environ.get("NICKELPIE_HTTPD_PORT"))),
+            HTTPHandler,
+        )
+
+        # Block forever.
+        s.serve_forever()
+
+    # Start main loop of this server in its own thread.
+    t = threading.Thread(target=run)
+
+    # Program exits when only daemon threads are left (no explicit join
+    # required in this case).
+    t.daemon = True
+    t.start()
+
+
+class Timer:
+    """
+    JP's quick version of a context manager that measures duration (wall time)
+    spent in the context.
+    """
+
+    def __init__(self, descr):
+        # Human-friendly short description of the operation that is being timed,
+        # used in log msgs.
+        self.descr = descr
+
+    def __enter__(self):
+        # Keep record of wall time upon entry. While not precise, this can still
+        # help correlate events in a distributed system when clocks are OK-ish
+        # aligned.
+        log.info("start: %s", self.descr)
+        self.t0_wall = datetime.now().strftime("%H:%M:%S.%f")
+        self.t0 = time.monotonic()
+        return self
+
+    def __exit__(self, _, __, ___):
+        t1 = time.monotonic()
+        dur = t1 - self.t0
+        log.info("done: %s, took %.6f s (started at %s)", self.descr, dur, self.t0_wall)
+
+
+def log_debug_info_assert_env():
+    """
+    Check on some invariants and log debug info.
+    """
+    log.info("cupy %s -- %s", cupy.__version__, cupy.__file__)
+    log.info("nccl available: %s", nccl.available)
+    log.info("nccl version: %s", nccl.get_version())
+    log.info("cuda driverGetVersion(): %s", cupy.cuda.runtime.driverGetVersion())
+    log.info(
+        "cuda get_local_runtime_version: %s", cupy.cuda.get_local_runtime_version()
+    )
+
+    devcount = cupy.cuda.runtime.getDeviceCount()
+
+    log.info("getDeviceCount(): %s", devcount)
+
+    # Log CUDA-related environment. Extend allow-list as needed.
+    for k, v in os.environ.items():
+        if "CUDA" in k or "NVIDIA" in k:
+            log.info("env: %s: %s", k, v)
+
+    try:
+        log.info(
+            "listdir(/dev/nvidia-caps-imex-channels): %s",
+            os.listdir("/dev/nvidia-caps-imex-channels"),
+        )
+    except Exception as exc:
+        log.info("cannot enumerate /dev/nvidia-caps-imex-channels: %s", exc)
+
+    try:
+        devs = open("/proc/devices", "rb").read().decode("utf-8").splitlines()
+        log.info(
+            "/proc/devices contains IMEX devices: %s",
+            [d for d in devs if "imex" in d.lower()],
+        )
+    except Exception as exc:
+        log.info("cannot inspect /proc/devices: %s", exc)
+
+    # For simplicity, towards single-GPU-per-container
+    assert devcount == 1, "precisely one CUDA device expected"
+
+    # Expect to be run as part of an indexed, parallel k8s job.
+    assert "JOB_COMPLETION_INDEX" in os.environ, "JOB_COMPLETION_INDEX not set in env"
+
+    log.info("NICKELPIE_HTTPD_DNSNAME: %s", os.environ.get("NICKELPIE_HTTPD_DNSNAME"))
+    log.info("NICKELPIE_HTTPD_PORT: %s", os.environ.get("NICKELPIE_HTTPD_PORT"))
+
+    log_device_properties()
+
+
+def log_device_properties():
+    """
+    Look up properties of that one device that has been made visible to process.
+    Log some properties. Extend allow-list as needed.
+    """
+
+    _attr_filter = ["name", "pci", "uuid", "multi", "minor", "major"]
+
+    # Assume there is just one device injected / available, and get its id
+    devidx = cupy.cuda.runtime.getDevice()
+
+    # for devidx in CUDA_DEVICE_INDICES:
+    for devidx in (devidx,):
+        dev = cupy.cuda.Device(devidx)
+        props = cupy.cuda.runtime.getDeviceProperties(devidx)
+
+        printprops = {}
+        for k, v in props.items():
+            for ss in _attr_filter:
+                if k.startswith(ss):
+                    if k == "uuid":
+                        try:
+                            v = uuid.UUID(bytes=v)
+                        except ValueError:
+                            # For some devices in some cases this does not seem to
+                            # report proper UUID raw data:
+                            # raise ValueError('bytes is not a 16-char string')
+                            log.warning("funky UUID bytes: %s", v)
+                            # Proceed with that funky value.
+                    printprops[k] = v
+                    break
+
+        log.info("%s properties:\n%s", dev, pformat(printprops))
+
+
+def sigterm_handler(_signo, _stack_frame):
+    # Raise SystemExit():
+    sys.exit("RECEIVED SIGTERM")
+
+
+if sys.argv[1] == "handle_signal":
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
+
+if __name__ == "__main__":
+    # Always have exit code 0 to not have the k8s job restart pods
+    try:
+        main()
+    except Exception:
+        log.exception("main() crash:")
+        log.info("exit 0")
+        sys.exit(0)
