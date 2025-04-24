@@ -1,6 +1,16 @@
 
 
-## build and push
+## usage
+
+```
+$ git clone https://github.com/jgehrcke/jpsnips-nv
+$ cd jpsnips-nv/nickelpie/one-pod-per-node/
+$ bash teardown-start-evaluate-npie-job.sh 2
+...
+```
+
+
+## dev: build and push
 
 ```
 $ docker buildx build \
