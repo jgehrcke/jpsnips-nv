@@ -1,5 +1,3 @@
-
-
 if [ $# -ne 1 ]; then
     echo "first arg: required: number of nodes/ranks"
     exit 1
@@ -10,7 +8,6 @@ fi
 
 cat npie-job.yaml | envsubst > npie-job.yaml.rendered
 
-
 set -x
 kubectl get resourceclaim
 kubectl get computedomains.resource.nvidia.com
@@ -19,27 +16,24 @@ kubectl delete computedomains.resource.nvidia.com nickelpie-test-compute-domain
 
 kubectl apply -f npie-job.yaml.rendered
 
-
-kubectl get resourceclaims.resource.k8s.io
+#kubectl get resourceclaims.resource.k8s.io
 
 for RANK in $(seq 1 "$((${NICKELPIE_N_RANKS}-1))");
 do
     kubectl wait --for=condition=Ready pods -l batch.kubernetes.io/job-completion-index=${RANK},job-name=nickelpie-test --timeout=40s
 done
 
-
-kubectl get resourceclaims.resource.k8s.io
 # How were the RCs constructed? Let's inspect their anatomy.
-kubectl describe resourceclaims.resource.k8s.io $(kubectl get resourceclaims.resource.k8s.io | grep nickelpie-test | head -n1 | awk '{print $1}')
-kubectl describe resourceclaims.resource.k8s.io $(kubectl get resourceclaims.resource.k8s.io | grep nickelpie-test | tail -n1 | awk '{print $1}')
-
-kubectl get resourceclaimtemplates.resource.k8s.io
-kubectl describe resourceclaimtemplates.resource.k8s.io $(kubectl get resourceclaimtemplates.resource.k8s.io | grep nickelpie-test | head -n1 | awk '{print $1}')
+#kubectl get resourceclaims.resource.k8s.io
+#kubectl describe resourceclaims.resource.k8s.io $(kubectl get resourceclaims.resource.k8s.io | grep nickelpie-test | head -n1 | awk '{print $1}')
+#kubectl describe resourceclaims.resource.k8s.io $(kubectl get resourceclaims.resource.k8s.io | grep nickelpie-test | tail -n1 | awk '{print $1}')
+#kubectl get resourceclaimtemplates.resource.k8s.io
+#kubectl describe resourceclaimtemplates.resource.k8s.io $(kubectl get resourceclaimtemplates.resource.k8s.io | grep nickelpie-test | head -n1 | awk '{print $1}')
 
 
 # show node hostnames
 kubectl get pods -o wide
-sleep 2
+sleep 5
 
 set +x
 echo -e "\n\nleader log tail:"

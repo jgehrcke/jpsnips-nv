@@ -23,7 +23,9 @@ import requests
 # error messages.
 # Show info levels, interleaved with stdout/stderr.
 # Enable timestamps for INFO msgs and higher.
-os.environ["NCCL_DEBUG"] = "INFO"
+# os.environ["NCCL_DEBUG"] = "INFO"
+os.environ["NCCL_DEBUG"] = "TRACE"
+
 # os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["NCCL_DEBUG_TIMESTAMP_LEVELS"] = "WARN,INFO,TRACE"
 os.environ["NCCL_DEBUG_TIMESTAMP_FORMAT"] = "[%F %T.%6f]"
@@ -215,8 +217,8 @@ def follower(jci, n_ranks: int):
     # Wait for the on-GPU NCCL communicator logic to have completed.
     # Calling send() or recv() before that might result in a hang.
     # I tried doing that with a CUDA event, but that didn't help.
-    log.info("wait 1 second for NCCL communicator setup")
-    time.sleep(1)
+    # log.info("wait for NCCL communicator setup")
+    # time.sleep(3)
     recv_matrix(c, jci, recvbuf)
 
     sync_with_leader_on_barrier("COLLECTIVE_BROADCAST_BENCHMARK")
@@ -279,8 +281,8 @@ def recv_matrix(communicator, jci: int, recvbuf: MatrixBuf):
     ev1 = cupy.cuda.Event()
     ev2 = cupy.cuda.Event()
     ev1.record()
-    for i in range(1, SENDRECV_LOOP_REPETITIONS + 1):
-        with Timer(f"communicator.recv() {i}/{SENDRECV_LOOP_REPETITIONS}"):
+    with Timer(f"recv()-from-0: {SENDRECV_LOOP_REPETITIONS} reps"):
+        for i in range(1, SENDRECV_LOOP_REPETITIONS + 1):
             communicator.recv(
                 recvbuf.data.ptr,
                 LARGE_PAYLOAD_VALUE_COUNT,
@@ -505,6 +507,14 @@ def create_nccl_communicator(n_ranks: int, comms_id, rank: int):
                 log.info("communicator not ready, retry. Result: %s", exc)
             time.sleep(0.5)
 
+    # log.info("wait for gpu stream to see and process post-nccl-comm-create event")
+    # explicitly wait until event has been processed by cuda stream, meaning
+    # that the nccl communicator work is done on-gpu
+    e = cupy.cuda.Event()
+    e.record()
+    e.synchronize()
+    log.info("post-nccl-comm-create event seen")
+
     return c
 
 
@@ -592,7 +602,13 @@ def wait_for_comm_id_from_leader() -> tuple:
     url = f"{LEADER_HTTPD_BASE_URL}/communication-id"
 
     log.info("enter loop: get NCCL communication ID from leader, URL: %s", url)
+
+    attempt = 0
+
     while True:
+
+        attempt += 1
+
         try:
             # Short connect()/recv() timeout to keep logs flowing.
             resp = requests.get(url, timeout=(4, 6))
@@ -605,7 +621,10 @@ def wait_for_comm_id_from_leader() -> tuple:
             )
         except requests.exceptions.RequestException as exc:
             # dns err, connect or recv timeout, etc
-            log.info("request failed, retry soon -- err was: %s", exc)
+            if attempt % 10 == 0:
+                log.info("request %s failed, retry soon -- err was: %s", attempt, exc)
+
+        # retry fast, therefore don't log err outcome of every attempt
         time.sleep(0.5)
 
     log.info("leader, got resp body (hex prefix): %s...", resp.content[:5].hex())
@@ -748,9 +767,9 @@ def log_debug_info_assert_env():
     log.info("getDeviceCount(): %s", devcount)
 
     # Log CUDA-related environment. Extend allow-list as needed.
-    for k, v in os.environ.items():
-        if "CUDA" in k or "NVIDIA" in k:
-            log.info("env: %s: %s", k, v)
+    # for k, v in os.environ.items():
+    #     if "CUDA" in k or "NVIDIA" in k:
+    #         log.info("env: %s: %s", k, v)
 
     try:
         log.info(
