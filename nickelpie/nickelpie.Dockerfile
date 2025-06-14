@@ -2,7 +2,7 @@
 # from source. The -devel- also image contains pre-built nccl, but not the
 # newest release. My goal here is to take control of the nccl version used
 # (built from source further below).
-FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build
+FROM nvidia/cuda:12.9.0-devel-ubuntu24.04 AS build
 
 # We need to build cupy from source below. Cupy binary distributions (wheel,
 # container images) for aarch64 are limited precisely in terms of nccl. Hence,
@@ -17,7 +17,7 @@ RUN <<EOT
     apt install -qyy \
         -o APT::Install-Recommends=false \
         -o APT::Install-Suggests=false \
-        build-essential \
+        build-essential git \
         wget devscripts debhelper fakeroot \
         g++ python3.12 python3.12-dev python3-pip-whl python3-setuptools-whl python3.12-venv
     apt clean
@@ -26,7 +26,7 @@ RUN <<EOT
 EOT
 
 # note: maybe use build stages approach, and after building copy artifacts into
-# image derived from 12.8.1-runtime-ubuntu24.04 (which is ~2 GB)
+# image derived from 12.9.0-runtime-ubuntu24.04 (which is ~2 GB)
 
 # Note: when running on an arch that we didn't compile for then nccl errors
 # might be rather wild, see https://github.com/NVIDIA/nccl/issues/1372 -- this
@@ -42,8 +42,8 @@ EOT
 RUN <<EOT
     export _NJOBS=$(($(nproc) / 2)) && echo "NJOBS: ${_NJOBS}"
     mkdir /ncclbuild && cd /ncclbuild
-    wget https://github.com/NVIDIA/nccl/archive/refs/tags/v2.26.2-1.tar.gz
-    tar xzf v2.26.2-1.tar.gz && cd nccl*
+    wget https://github.com/NVIDIA/nccl/archive/refs/tags/v2.27.3-1.tar.gz
+    tar xzf v2.27.3-1.tar.gz && cd nccl*
     make -j${_NJOBS} src.build \
         NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100 -gencode=arch=compute_120,code=sm_120"
     make -j${_NJOBS} pkg.debian.build
@@ -68,34 +68,46 @@ RUN <<EOT
     python -Im site
 EOT
 
+# Install just-built nccl packages (important: -dev pkg) so that the cupy build
+# below builds against that!
+RUN apt install --allow-change-held-packages -y /nccl-debs/libnccl2*deb /nccl-debs/libnccl-dev*deb
+
 # Build cupy from source. Limit to same CUDA architectures as nccl build above.
 # Ref for env vars affecting build:
 # https://docs.cupy.dev/en/latest/reference/environment.html
+# Used dev version of 14.x cupy, also because of https://github.com/cupy/cupy/issues/9128
+
 RUN <<EOT
     export _NJOBS=$(($(nproc) / 2)) && echo "NJOBS: ${_NJOBS}"
     export CUPY_NUM_BUILD_JOBS="${_NJOBS}"
     export CUPY_NUM_NVCC_THREADS="4"
     export CUPY_NVCC_GENERATE_CODE="arch=compute_90,code=sm_90;arch=compute_100,code=sm_100;arch=compute_120,code=sm_120"
-    pip install --verbose cupy --log pip_cupy_build.log && pip cache purge
+    pip install --verbose  git+https://github.com/cupy/cupy.git@020213b469f12f5f7dc2031f6b097d51bf7655f9\
+        --log pip_cupy_build.log && \
+        pip cache purge
 EOT
 
-# Note(JP): at the time of writing the system-provided nccl was version 2.25.
-# The source build is for 2.26.2. The output below was confirmed to be "22602",
-# confirming a proper build.
-RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())"
+# Note(JP): fail if we accidentally build against the nccl version that's
+# shipped in the base image.
+RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())" | grep "22703"
 
+# nickelpie dependency
 RUN pip install requests
+
+# Note(JP): fix runtime errors such as "cupy/carray.cuh(57): catastrophic error:
+# cannot open source file "cuda_fp16.h"" Turns out: cupy JIT/runtime compilation
+# needs CUDA header files that are "efficiently" bundled in the NVIDIA
+# nvidia-cuda-runtime-cu12 package. Also see
+# https://github.com/cupy/cupy/issues/865
+RUN pip install nvidia-cuda-runtime-cu12==12.9.79
 
 RUN find / -name "libcurand.so.10"
 RUN find / -name "libnvrtc.so.12"
 
 
-# FROM ubuntu:24.04 AS prod
-
-# With just the `12.8.1-base` image: runtime dependencies are missing such as
-# curand.so. I thought these might also get mounted in by the container toolkit?
-#FROM nvcr.io/nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS prod
-FROM nvcr.io/nvidia/cuda:12.8.1-base-ubuntu24.04 AS prod
+# With just the `12.9.0-base` image: runtime dependencies are missing such as
+# curand.so.
+FROM nvcr.io/nvidia/cuda:12.9.0-base-ubuntu24.04 AS prod
 
 
 RUN <<EOT
@@ -131,10 +143,10 @@ RUN cd /nccl-debs && ls -1 && apt install --allow-change-held-packages -y ./libn
 # We don't need all CUDA math libraries (such as cuFFT and cuSPARSE). This list
 # was assembled by trial and error, more libs added as errors popped up,
 # example: "cupy.cuda.compiler.CompileException: nvrtc: error: failed to open
-# libnvrtc-builtins.so.12.8"
-COPY --from=build /usr/local/cuda-12.8/targets/sbsa-linux/lib/libcurand.so.10 /usr/local/cuda-12.8/targets/sbsa-linux/lib/libcurand.so.10
-COPY --from=build /usr/local/cuda-12.8/targets/sbsa-linux/lib/libnvrtc.so.12 /usr/local/cuda-12.8/targets/sbsa-linux/lib/libnvrtc.so.12
-COPY --from=build /usr/local/cuda-12.8/targets/sbsa-linux/lib/libnvrtc-builtins.so.12.8 /usr/local/cuda-12.8/targets/sbsa-linux/lib/libnvrtc-builtins.so.12.8
+# libnvrtc-builtins.so.12.9"
+COPY --from=build /usr/local/cuda-12.9/targets/sbsa-linux/lib/libcurand.so.10 /usr/local/cuda-12.9/targets/sbsa-linux/lib/libcurand.so.10
+COPY --from=build /usr/local/cuda-12.9/targets/sbsa-linux/lib/libnvrtc.so.12 /usr/local/cuda-12.9/targets/sbsa-linux/lib/libnvrtc.so.12
+COPY --from=build /usr/local/cuda-12.9/targets/sbsa-linux/lib/libnvrtc-builtins.so.12.9 /usr/local/cuda-12.9/targets/sbsa-linux/lib/libnvrtc-builtins.so.12.9
 
 RUN du -ha / | sort -h  -r | head -n 100
 
