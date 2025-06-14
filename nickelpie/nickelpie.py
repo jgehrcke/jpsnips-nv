@@ -60,36 +60,42 @@ logging.basicConfig(
 # global dictionary, thread-safe updates
 DYNCFG = {"nccl_comm_id": "not-set"}
 
-_MATRIX_SIZE = 3
-if len(sys.argv) > 1:
-    try:
-        _MATRIX_SIZE = int(sys.argv[1])
-    except ValueError:
-        pass
+
+# 10000 is a decent edge length to start with 35000x35000 seems to translate to
+# ~5 GB in GPU memory. Going up and down from there with a simple scale factor
+# that can be set via environment variable.
+LARGE_PAYLOAD_SHAPE = (int(4.5 * 10**4), int(4.5 * 10**4))
+if "NICKELPIE_MATRIX_SCALE" in os.environ:
+    _scalef = float(os.environ["NICKELPIE_MATRIX_SCALE"])
+    LARGE_PAYLOAD_SHAPE = (int(_scalef * 10**4), int(_scalef * 10**4))
 
 
 LARGE_PAYLOAD_DTYPE = numpy.float32  # 64
 LARGE_PAYLOAD_DTYPE_NCCL = nccl.NCCL_FLOAT32  # 64
-LARGE_PAYLOAD_SHAPE = (int(3.5 * 10**_MATRIX_SIZE), int(3.5 * 10**_MATRIX_SIZE))
-LARGE_PAYLOAD_VALUE_COUNT = LARGE_PAYLOAD_SHAPE[0] * LARGE_PAYLOAD_SHAPE[1]
 LARGE_PAYLOAD_BYTES_PER_VALUE = 4
+
+
+LARGE_PAYLOAD_VALUE_COUNT = LARGE_PAYLOAD_SHAPE[0] * LARGE_PAYLOAD_SHAPE[1]
 LARGE_PAYLOAD_SIZE_MB = (LARGE_PAYLOAD_VALUE_COUNT * LARGE_PAYLOAD_BYTES_PER_VALUE) / (
     10**6
 )
 
 # At an expected bandwidth of about 700 GB/s pick an amount that will take a
 # small number of seconds to be transmitted.
-SEND_TOTAL_GB_ACROSS_REPETITIONS = 2000
+SEND_TOTAL_GB_ACROSS_REPETITIONS = 10000
+
+if "NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK" in os.environ:
+    SEND_TOTAL_GB_ACROSS_REPETITIONS = int(
+        os.environ["NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK"]
+    )
+
 SENDRECV_LOOP_REPETITIONS = int(
     SEND_TOTAL_GB_ACROSS_REPETITIONS / (LARGE_PAYLOAD_SIZE_MB / 1000.0)
 )
 
-# Prepare events for synchronization across threads.
-# _barriers = ["COMMUNICATOR_SETUP", "WARMUP_EXCHANGE", "BENCHMARK"]
+
+# Prepare to store events for synchronization (across threads).
 EVENTS = {}
-# for _b in _barriers:
-#     EVENTS["BARRIER_FOLLOWER_" + _b] = threading.Event()
-#     EVENTS["BARRIER_LEADER_" + _b] = threading.Event()
 
 
 LEADER_HTTPD_BASE_URL = (
