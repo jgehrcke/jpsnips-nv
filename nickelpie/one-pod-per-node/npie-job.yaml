@@ -81,3 +81,10 @@ spec:
       resourceClaims:
       - name: compute-domain-channel
         resourceClaimTemplateName: nickelpie-test-compute-domain-channel
+      tolerations:
+      - key: dedicated
+        operator: Exists
+      - effect: NoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+
