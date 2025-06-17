@@ -8,12 +8,8 @@ import threading
 import pickle
 
 from typing import NewType, cast
-
-
 from datetime import datetime
-
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-
 from pprint import pformat
 
 import requests
@@ -24,42 +20,28 @@ import requests
 # Show info levels, interleaved with stdout/stderr.
 # Enable timestamps for INFO msgs and higher.
 # os.environ["NCCL_DEBUG"] = "INFO"
-os.environ["NCCL_DEBUG"] = "TRACE"
+os.environ["NCCL_DEBUG"] = "INFO"
 
 # os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["NCCL_DEBUG_TIMESTAMP_LEVELS"] = "WARN,INFO,TRACE"
 os.environ["NCCL_DEBUG_TIMESTAMP_FORMAT"] = "[%F %T.%6f]"
 
-
-if "NCCL_MNNVL_ENABLE" not in os.environ:
-    # If set externally this takes precedence. Note: when set to 1 things still
-    # don't fail when MNNVL isn't available, there seems to be graceful
-    # degradation after showing an error message.
-    # os.environ["NCCL_MNNVL_ENABLE"] = "0"
-    # just for fun
-    # os.environ["NCCL_P2P_DISABLE"] = "1"
-    ...
-
-
 import cupy
 from cupy.cuda import nccl
 import numpy
 
-# NVIDIA's python bindings for the CUDA API.
-# https://github.com/NVIDIA/cuda-python
-# import cuda
-# from cuda.bindings import driver, runtime, nvrtc
-
 log = logging.getLogger()
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d %(levelname)s %(thread)d: %(message)s",
-    datefmt="%y%m%d-%H:%M:%S",
+    format="%(asctime)s.%(msecs)03dZ %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
+
+# Explicit UTC timezone.
+logging.Formatter.converter = time.gmtime
 
 # global dictionary, thread-safe updates
 DYNCFG = {"nccl_comm_id": "not-set"}
-
 
 # 10000 is a decent edge length to start with 35000x35000 seems to translate to
 # ~5 GB in GPU memory. Going up and down from there with a simple scale factor
@@ -73,14 +55,12 @@ if "NICKELPIE_MATRIX_SCALE" in os.environ:
 LARGE_PAYLOAD_DTYPE = numpy.float32  # 64
 LARGE_PAYLOAD_DTYPE_NCCL = nccl.NCCL_FLOAT32  # 64
 LARGE_PAYLOAD_BYTES_PER_VALUE = 4
-
-
 LARGE_PAYLOAD_VALUE_COUNT = LARGE_PAYLOAD_SHAPE[0] * LARGE_PAYLOAD_SHAPE[1]
 LARGE_PAYLOAD_SIZE_MB = (LARGE_PAYLOAD_VALUE_COUNT * LARGE_PAYLOAD_BYTES_PER_VALUE) / (
     10**6
 )
 
-# At an expected bandwidth of about 700 GB/s pick an amount that will take a
+# At an expected bandwidth of about 700 GB/s, pick an amount that will take a
 # small number of seconds to be transmitted.
 SEND_TOTAL_GB_ACROSS_REPETITIONS = 10000
 
@@ -452,6 +432,30 @@ def log_transfer_stats(elapsed_s: float, descr: str, broadcast_factor=0):
         elapsed_s,
     )
     bandwidth_gib_per_second = amount_gib / elapsed_s
+
+    # Note(JP): as always, bandwidth measurement is involved. On NVLink systems,
+    # in particular GB200 MNNVL, this number should not be compared to "raw
+    # NVLink" performance. NCCL sits on top of that and has its own overhead.
+    # Also, measurement results depend on what _exactly_ is times, and on how
+    # _exactly_ bandwidth is defined in the first place. Hence, what we measure
+    # here is for example also not directly comparable to nvbandwidth results
+    # (nvb does not use nccl, but an in-between approach involving CUDA API
+    # only, i.e. what NCCL uses internally (for _some_ things). I have found
+    # thaton GB200 systems indeed I get to those numbers that the NCCL team is
+    # mentioning in various conversational threads. For example: "on GB200
+    # allreduce at 16G message size without NVLS: 650-680 GB/s". In
+    # uni-directional benchmark tests using just ncclSend() and ncclRecv() in
+    # nickelpie, I regularly see numbers like 696.073 GB/s which are rather
+    # consistent with that. I also have read that "NVLS gets you faster perf,
+    # 830-900 GB/s" -- but that is about aggregations like ncclAllReduce().
+    #
+    # Other statements, ripped out of context, but providing a broad picture:
+    #
+    # - "Within 1 rack with 18 nodes GB200 NVL72 for alltoall why does the BW
+    #   performance degrade at 14 nodes. It goes from 1 node: ~680 GB/s; 2 to 12
+    #   nodes: ~666 GB/s; 14 to 18 nodes: ~630 GB/s"
+    # - "Allreduce should reach over 850GB/s with NVLS around 680GB/s without.
+    #   A2A should hit about 630GB/s"
     log.info("%s RESULT bandwidth: %.3f GB/s", descr, bandwidth_gib_per_second)
 
 
