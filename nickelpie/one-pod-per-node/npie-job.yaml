@@ -67,10 +67,16 @@ spec:
         env:
         - name: NICKELPIE_RANKS
           value: "${NICKELPIE_N_RANKS}"
+        - name: NICKELPIE_MATRIX_SCALE
+          value: "${NICKELPIE_MATRIX_SCALE}"
+        - name: NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK
+          value: "${NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK}"
         - name: NICKELPIE_HTTPD_DNSNAME
           value: "nickelpie-test-0.svc-nickelpie"
         - name: NICKELPIE_HTTPD_PORT
           value: "1337"
+        - name: NCCL_NVLS_ENABLE
+          value: "1"
         ports:
         - containerPort: 1337
         resources:

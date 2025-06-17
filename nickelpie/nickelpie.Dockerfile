@@ -104,11 +104,9 @@ RUN pip install nvidia-cuda-runtime-cu12==12.9.79
 RUN find / -name "libcurand.so.10"
 RUN find / -name "libnvrtc.so.12"
 
-
 # With just the `12.9.0-base` image: runtime dependencies are missing such as
 # curand.so.
 FROM nvcr.io/nvidia/cuda:12.9.0-base-ubuntu24.04 AS prod
-
 
 RUN <<EOT
     apt update -qy
