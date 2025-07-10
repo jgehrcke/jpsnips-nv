@@ -2,7 +2,7 @@
 # from source. The -devel- also image contains pre-built nccl, but not the
 # newest release. My goal here is to take control of the nccl version used
 # (built from source further below).
-FROM nvidia/cuda:12.9.0-devel-ubuntu24.04 AS build
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS build
 
 # We need to build cupy from source below. Cupy binary distributions (wheel,
 # container images) for aarch64 are limited precisely in terms of nccl. Hence,
@@ -40,25 +40,29 @@ EOT
 # for both, libnccl2 and libnccl-dev). Assume build on a machine with many cores
 # (100+), use ~half of them for build job concurrency.
 RUN <<EOT
+    export NCCL_VERSION="v2.27.5-1"
     export _NJOBS=$(($(nproc) / 2)) && echo "NJOBS: ${_NJOBS}"
     mkdir /ncclbuild && cd /ncclbuild
-    wget https://github.com/NVIDIA/nccl/archive/refs/tags/v2.27.3-1.tar.gz
-    tar xzf v2.27.3-1.tar.gz && cd nccl*
+    wget https://github.com/NVIDIA/nccl/archive/refs/tags/${NCCL_VERSION}.tar.gz
+    tar xzf ${NCCL_VERSION}.tar.gz && cd nccl*
     make -j${_NJOBS} src.build \
         NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100 -gencode=arch=compute_120,code=sm_120"
     make -j${_NJOBS} pkg.debian.build
     cd build/pkg/deb/ && ls *deb
     mkdir /nccl-debs && cp *deb /nccl-debs
-    #apt install --allow-change-held-packages -y ./libnccl2*deb ./libnccl-dev*deb
     cd / && rm -rf /ncclbuild # this frees up about 1 GB.
 EOT
 
-RUN mkdir /thing
-WORKDIR /thing
+# Install _that_ version of nccl (before the cupy build below).
+# This replaces whatever has been built into the cuda -devel- image.
+RUN cd /nccl-debs && ls -1 && apt install --allow-change-held-packages -y ./*deb
+
+RUN mkdir /npie
+WORKDIR /npie
 
 #  Construct venv over system Python.
 RUN python3 -m venv .venv
-ENV PATH="/thing/.venv/bin:${PATH}"
+ENV PATH="/npie/.venv/bin:${PATH}"
 
 # Diagnostics output about Python environment
 RUN <<EOT
@@ -70,7 +74,9 @@ EOT
 
 # Install just-built nccl packages (important: -dev pkg) so that the cupy build
 # below builds against that!
-RUN apt install --allow-change-held-packages -y /nccl-debs/libnccl2*deb /nccl-debs/libnccl-dev*deb
+# RUN apt install --allow-change-held-packages -y /nccl-debs/libnccl2*deb /nccl-debs/libnccl-dev*deb
+
+# RUN pip install -v nvidia-nccl-cu12==2.27.5
 
 # Build cupy from source. Limit to same CUDA architectures as nccl build above.
 # Ref for env vars affecting build:
@@ -82,14 +88,15 @@ RUN <<EOT
     export CUPY_NUM_BUILD_JOBS="${_NJOBS}"
     export CUPY_NUM_NVCC_THREADS="4"
     export CUPY_NVCC_GENERATE_CODE="arch=compute_90,code=sm_90;arch=compute_100,code=sm_100;arch=compute_120,code=sm_120"
-    pip install --verbose  git+https://github.com/cupy/cupy.git@020213b469f12f5f7dc2031f6b097d51bf7655f9\
+    pip install --verbose  git+https://github.com/cupy/cupy.git@03c3845d8bf473adbe6fdb23f13cf5d3de579af6 \
         --log pip_cupy_build.log && \
         pip cache purge
 EOT
 
 # Note(JP): fail if we accidentally build against the nccl version that's
-# shipped in the base image.
-RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())" | grep "22703"
+# shipped in the base image. First, show version. Second, test version.
+RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())"
+RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())" | grep "22705"
 
 # nickelpie dependency
 RUN pip install requests
@@ -101,19 +108,23 @@ RUN pip install requests
 # https://github.com/cupy/cupy/issues/865
 RUN pip install nvidia-cuda-runtime-cu12==12.9.79
 
+# Test python (v)env.
+RUN python3 -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())"
+RUN python3 -c "import cupy; print(cupy.cuda.runtime.driverGetVersion())"
+
 RUN find / -name "libcurand.so.10"
 RUN find / -name "libnvrtc.so.12"
 
 # With just the `12.9.0-base` image: runtime dependencies are missing such as
 # curand.so.
-FROM nvcr.io/nvidia/cuda:12.9.0-base-ubuntu24.04 AS prod
+FROM nvcr.io/nvidia/cuda:12.9.1-base-ubuntu24.04 AS prod
 
 RUN <<EOT
     apt update -qy
     apt install -qyy \
         -o APT::Install-Recommends=false \
         -o APT::Install-Suggests=false \
-        python3  python3-venv
+        python3 python3-venv
     apt clean
     rm -rf /var/lib/apt/lists/*
     rm -rf /opt/nvidia/nsight-compute
@@ -121,10 +132,10 @@ EOT
 
 #  Construct venv over system Python.
 RUN python3 -m venv .venv
-ENV PATH="/thing/.venv/bin:${PATH}"
+ENV PATH="/npie/.venv/bin:${PATH}"
 
 # Contains python venv (cupy build)
-COPY --from=build /thing /thing
+COPY --from=build /npie /npie
 
 # diagnostics output about Python environment
 RUN <<EOT
@@ -133,7 +144,8 @@ RUN <<EOT
     python3 -Im site
 EOT
 
-# Do not install ./libnccl-dev*deb for now.
+# Do not install ./libnccl-dev*deb for now. Layer cache-wise, it would probably
+# be smart to install the deb without the cp/rm wrapper.
 RUN mkdir /nccl-debs
 COPY --from=build /nccl-debs/libnccl2*deb /nccl-debs
 RUN cd /nccl-debs && ls -1 && apt install --allow-change-held-packages -y ./libnccl2*deb && rm -rf /nccl-debs
@@ -156,7 +168,7 @@ RUN python3 -c "import cupy; print(cupy.cuda.runtime.driverGetVersion())"
 # provides e.g. https://nvidia.github.io/cuda-python/cuda-bindings/latest/module/driver.html#cuda.bindings.driver.cuMemExportToShareableHandle
 # RUN pip install cuda-python[all]
 
-COPY ./nickelpie.py /thing
+COPY ./nickelpie.py /npie
 
 # Override original/NVIDIA entry point.
 # Launch Python application e.g. via
