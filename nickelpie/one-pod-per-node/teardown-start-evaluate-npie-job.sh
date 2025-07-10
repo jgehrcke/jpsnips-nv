@@ -26,6 +26,7 @@ function parse_args
           -n | --n-ranks )             export NICKELPIE_N_RANKS="$2";             shift;;
           -m | --matrix-scale )        export NICKELPIE_MATRIX_SCALE="$2";     shift;;
           -g | --gb-per-benchmark )    export NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK="$2";      shift;;
+          -s | --sleep-after-work )    export NICKELPIE_SLEEP_AFTER_WORK="$2";      shift;;
           -h | --help )                usage;                   exit;; # quit and show usage
           * )                          args+=("$1")             # if no match, add it to the positional args
       esac
@@ -58,6 +59,11 @@ function parse_args
   if [[ -z "$NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK" ]]; then
       export NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK="1200"
   fi
+
+  if [[ -z "$NICKELPIE_SLEEP_AFTER_WORK" ]]; then
+      export NICKELPIE_SLEEP_AFTER_WORK="0"
+  fi
+
 }
 
 parse_args "$@"
@@ -65,6 +71,7 @@ parse_args "$@"
 echo "NICKELPIE_N_RANKS: $NICKELPIE_N_RANKS"
 echo "NICKELPIE_MATRIX_SCALE: $NICKELPIE_MATRIX_SCALE"
 echo "NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK: $NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK"
+echo "NICKELPIE_SLEEP_AFTER_WORK: $NICKELPIE_SLEEP_AFTER_WORK"
 
 cat npie-job.yaml | envsubst > npie-job.yaml.rendered
 

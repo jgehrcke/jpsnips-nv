@@ -63,7 +63,7 @@ spec:
       containers:
       - name: nickelpie-test
         image: docker.io/jgehrcke/nickelpie:latest
-        command: ["python3", "/thing/nickelpie.py", "4"]
+        command: ["python3", "/npie/nickelpie.py", "4"]
         env:
         - name: NICKELPIE_RANKS
           value: "${NICKELPIE_N_RANKS}"
@@ -71,6 +71,8 @@ spec:
           value: "${NICKELPIE_MATRIX_SCALE}"
         - name: NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK
           value: "${NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK}"
+        - name: NICKELPIE_SLEEP_AFTER_WORK
+          value: "${NICKELPIE_SLEEP_AFTER_WORK}"
         - name: NICKELPIE_HTTPD_DNSNAME
           value: "nickelpie-test-0.svc-nickelpie"
         - name: NICKELPIE_HTTPD_PORT

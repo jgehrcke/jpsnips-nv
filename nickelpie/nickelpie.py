@@ -108,6 +108,12 @@ def main():
     #     time.sleep(30)
     #     log.info("wait")
 
+    saw = os.environ.get("NICKELPIE_SLEEP_AFTER_WORK")
+    if saw:
+        # Not None, not empty string
+        log.info('NICKELPIE_SLEEP_AFTER_WORK: %s', saw)
+        time.sleep(float(saw))
+
     log.info("shutdown")
 
 
