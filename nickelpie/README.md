@@ -5,8 +5,22 @@
 ```
 $ git clone https://github.com/jgehrcke/jpsnips-nv
 $ cd jpsnips-nv/nickelpie/one-pod-per-node/
-$ bash teardown-start-evaluate-npie-job.sh 2
+$ bash teardown-start-evaluate-npie-job.sh --n-ranks 2
 ...
+
+send-recv-0->1(0) RESULT data sent: 1196.800 GB, time elapsed: 1.706 s
+send-recv-0->1(0) RESULT bandwidth: 701.721 GB/s
+broadcast-0->[1](0) RESULT data sent: 1196.800 GB, time elapsed: 1.783 s
+broadcast-0->[1](0) RESULT bandwidth: 671.052 GB/s
+send-recv-0->1(1) RESULT data sent: 1196.800 GB, time elapsed: 1.705 s
+send-recv-0->1(1) RESULT bandwidth: 701.889 GB/s
+broadcast-0->[1](1) RESULT data sent: 1196.800 GB, time elapsed: 1.783 s
+broadcast-0->[1](1) RESULT bandwidth: 671.171 GB/s
+
+overall job status:
+NAME             STATUS     COMPLETIONS   DURATION   AGE
+nickelpie-test   Complete   2/2           24s        25s
+
 ```
 
 
