@@ -36,20 +36,9 @@ function parse_args
   # restore positional args
   set -- "${args[@]}"
 
-  # set positionals to vars
-  #positional_1="${args[0]}"
-  #positional_2="${args[1]}"
-
-  # validate required args
-#   if [[ -z "${an_arg}" || -z "${some_more_args}" ]]; then
-#       echo "Invalid arguments"
-#       usage
-#       exit;
-#   fi
-
   # set defaults
   if [[ -z "$NICKELPIE_N_RANKS" ]]; then
-      export NICKELPIE_N_RANKS="3"
+      export NICKELPIE_N_RANKS="2"
   fi
 
   if [[ -z "$NICKELPIE_MATRIX_SCALE" ]]; then
