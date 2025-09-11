@@ -2,7 +2,7 @@
 # from source. The -devel- also image contains pre-built nccl, but not the
 # newest release. My goal here is to take control of the nccl version used
 # (built from source further below).
-FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS build
+FROM nvidia/cuda:13.0.1-devel-ubuntu24.04 AS build
 
 # We need to build cupy from source below. Cupy binary distributions (wheel,
 # container images) for aarch64 are limited precisely in terms of nccl. Hence,
@@ -40,7 +40,7 @@ EOT
 # for both, libnccl2 and libnccl-dev). Assume build on a machine with many cores
 # (100+), use ~half of them for build job concurrency.
 RUN <<EOT
-    export NCCL_VERSION="v2.27.7-1"
+    export NCCL_VERSION="v2.28.3-1"
     export _NJOBS=$(($(nproc) / 2)) && echo "NJOBS: ${_NJOBS}"
     mkdir /ncclbuild && cd /ncclbuild
     wget https://github.com/NVIDIA/nccl/archive/refs/tags/${NCCL_VERSION}.tar.gz
@@ -88,7 +88,7 @@ RUN <<EOT
     export CUPY_NUM_BUILD_JOBS="${_NJOBS}"
     export CUPY_NUM_NVCC_THREADS="4"
     export CUPY_NVCC_GENERATE_CODE="arch=compute_90,code=sm_90;arch=compute_100,code=sm_100;arch=compute_120,code=sm_120"
-    pip install --verbose  git+https://github.com/cupy/cupy.git@03c3845d8bf473adbe6fdb23f13cf5d3de579af6 \
+    pip install --verbose  git+https://github.com/cupy/cupy.git@v13.6.0 \
         --log pip_cupy_build.log && \
         pip cache purge
 EOT
@@ -96,7 +96,7 @@ EOT
 # Note(JP): fail if we accidentally build against the nccl version that's
 # shipped in the base image. First, show version. Second, test version.
 RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())"
-RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())" | grep "22707"
+RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())" | grep "22803"
 
 # nickelpie dependency
 RUN pip install requests
@@ -106,7 +106,7 @@ RUN pip install requests
 # needs CUDA header files that are "efficiently" bundled in the NVIDIA
 # nvidia-cuda-runtime-cu12 package. Also see
 # https://github.com/cupy/cupy/issues/865
-RUN pip install nvidia-cuda-runtime-cu12==12.9.79
+RUN pip install nvidia-cuda-runtime==13.0.88
 
 # Test python (v)env.
 RUN python3 -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())"
@@ -117,7 +117,7 @@ RUN find / -name "libnvrtc.so.12"
 
 # With just the `12.9.0-base` image: runtime dependencies are missing such as
 # curand.so.
-FROM nvcr.io/nvidia/cuda:12.9.1-base-ubuntu24.04 AS prod
+FROM nvcr.io/nvidia/cuda:13.0.1-base-ubuntu24.04 AS prod
 
 RUN <<EOT
     apt update -qy
@@ -154,9 +154,9 @@ RUN cd /nccl-debs && ls -1 && apt install --allow-change-held-packages -y ./libn
 # was assembled by trial and error, more libs added as errors popped up,
 # example: "cupy.cuda.compiler.CompileException: nvrtc: error: failed to open
 # libnvrtc-builtins.so.12.9"
-COPY --from=build /usr/local/cuda-12.9/targets/sbsa-linux/lib/libcurand.so.10 /usr/local/cuda-12.9/targets/sbsa-linux/lib/libcurand.so.10
-COPY --from=build /usr/local/cuda-12.9/targets/sbsa-linux/lib/libnvrtc.so.12 /usr/local/cuda-12.9/targets/sbsa-linux/lib/libnvrtc.so.12
-COPY --from=build /usr/local/cuda-12.9/targets/sbsa-linux/lib/libnvrtc-builtins.so.12.9 /usr/local/cuda-12.9/targets/sbsa-linux/lib/libnvrtc-builtins.so.12.9
+COPY --from=build /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcurand.so.10 /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcurand.so.10
+COPY --from=build /usr/local/cuda-13.0/targets/sbsa-linux/lib/libnvrtc.so.13 /usr/local/cuda-13.0/targets/sbsa-linux/lib/libnvrtc.so.13
+COPY --from=build /usr/local/cuda-13.0/targets/sbsa-linux/lib/libnvrtc-builtins.so.13.0 /usr/local/cuda-13.0/targets/sbsa-linux/lib/libnvrtc-builtins.so.13.0
 
 RUN du -ha / | sort -h  -r | head -n 100
 
