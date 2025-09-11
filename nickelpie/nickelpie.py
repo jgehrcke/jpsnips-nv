@@ -20,11 +20,11 @@ import requests
 # Show info levels, interleaved with stdout/stderr.
 # Enable timestamps for INFO msgs and higher.
 # os.environ["NCCL_DEBUG"] = "INFO"
-os.environ["NCCL_DEBUG"] = "INFO"
 
 # os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["NCCL_DEBUG_TIMESTAMP_LEVELS"] = "WARN,INFO,TRACE"
 os.environ["NCCL_DEBUG_TIMESTAMP_FORMAT"] = "[%F %T.%6f]"
+
 
 import cupy
 from cupy.cuda import nccl
@@ -43,6 +43,8 @@ logging.Formatter.converter = time.gmtime
 # global dictionary, thread-safe updates
 DYNCFG = {"nccl_comm_id": "not-set"}
 
+log.info("NCCL_DEBUG: %s", os.environ["NCCL_DEBUG"])
+
 # 10000 is a decent edge length to start with 35000x35000 seems to translate to
 # ~5 GB in GPU memory. Going up and down from there with a simple scale factor
 # that can be set via environment variable.
@@ -50,6 +52,8 @@ LARGE_PAYLOAD_SHAPE = (int(4.5 * 10**4), int(4.5 * 10**4))
 if "NICKELPIE_MATRIX_SCALE" in os.environ:
     _scalef = float(os.environ["NICKELPIE_MATRIX_SCALE"])
     LARGE_PAYLOAD_SHAPE = (int(_scalef * 10**4), int(_scalef * 10**4))
+
+log.info('LARGE_PAYLOAD_SHAPE: %s', LARGE_PAYLOAD_SHAPE)
 
 
 LARGE_PAYLOAD_DTYPE = numpy.float32  # 64
@@ -103,16 +107,12 @@ def main():
     else:
         follower(jci, n_ranks)
 
-    # Not yet sure if I tear down NCCL properly, wait for more logs to appear.
-    # for _ in range(1200):
-    #     time.sleep(30)
-    #     log.info("wait")
 
     saw = os.environ.get("NICKELPIE_SLEEP_AFTER_WORK")
     if saw:
         # Not None, not empty string
         log.info('NICKELPIE_SLEEP_AFTER_WORK: %s', saw)
-        time.sleep(float(saw))
+        # time.sleep(float(saw))
 
     log.info("shutdown")
 
@@ -855,15 +855,6 @@ def log_device_properties():
                     break
 
         log.info("%s properties:\n%s", dev, pformat(printprops))
-
-
-def sigterm_handler(_signo, _stack_frame):
-    # Raise SystemExit():
-    sys.exit("RECEIVED SIGTERM")
-
-
-if sys.argv[1] == "handle_signal":
-    signal.signal(signal.SIGTERM, sigterm_handler)
 
 
 if __name__ == "__main__":
