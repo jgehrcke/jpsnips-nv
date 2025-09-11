@@ -40,7 +40,7 @@ EOT
 # for both, libnccl2 and libnccl-dev). Assume build on a machine with many cores
 # (100+), use ~half of them for build job concurrency.
 RUN <<EOT
-    export NCCL_VERSION="v2.27.7-1"
+    export NCCL_VERSION="v2.28.3-1"
     export _NJOBS=$(($(nproc) / 2)) && echo "NJOBS: ${_NJOBS}"
     mkdir /ncclbuild && cd /ncclbuild
     wget https://github.com/NVIDIA/nccl/archive/refs/tags/${NCCL_VERSION}.tar.gz
@@ -55,7 +55,7 @@ EOT
 
 # Install _that_ version of nccl (before the cupy build below).
 # This replaces whatever has been built into the cuda -devel- image.
-RUN cd /nccl-debs && ls -1 && apt install --allow-change-held-packages --allow-downgrades -y ./*deb
+RUN cd /nccl-debs && ls -1 && apt install --allow-change-held-packages -y ./*deb
 
 RUN mkdir /npie
 WORKDIR /npie
@@ -96,7 +96,7 @@ EOT
 # Note(JP): fail if we accidentally build against the nccl version that's
 # shipped in the base image. First, show version. Second, test version.
 RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())"
-RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())" | grep "22707"
+RUN python -c "import cupy.cuda.nccl; print(cupy.cuda.nccl.get_version())" | grep "22803"
 
 # nickelpie dependency
 RUN pip install requests
