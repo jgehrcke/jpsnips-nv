@@ -62,7 +62,7 @@ spec:
       subdomain: svc-nickelpie  # has to match service name
       containers:
       - name: nickelpie-test
-        image: docker.io/jgehrcke/nickelpie:latest
+        image: docker.io/jgehrcke/nickelpie:v25.9.12-1
         command:
           - /bin/sh
           - -c

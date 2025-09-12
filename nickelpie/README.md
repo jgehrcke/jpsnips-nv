@@ -2,10 +2,20 @@
 
 ## usage
 
+Prepare and run:
 ```
-$ git clone https://github.com/jgehrcke/jpsnips-nv
-$ cd jpsnips-nv/nickelpie/one-pod-per-node/
-$ bash teardown-start-evaluate-npie-job.sh --n-ranks 2
+git clone https://github.com/jgehrcke/jpsnips-nv
+cd jpsnips-nv/nickelpie/one-pod-per-node/
+
+# Default parameters: send/recv load across two
+# nodes, expected to take less than 30 seconds on
+# GB200. The first image pull might take a moment
+# (~1 GB).
+bash teardown-start-evaluate-npie-job.sh
+```
+
+Example output:
+```
 ...
 
 send-recv-0->1(0) RESULT data sent: 1196.800 GB, time elapsed: 1.706 s
@@ -20,22 +30,27 @@ broadcast-0->[1](1) RESULT bandwidth: 671.171 GB/s
 overall job status:
 NAME             STATUS     COMPLETIONS   DURATION   AGE
 nickelpie-test   Complete   2/2           24s        25s
-
 ```
 
 
 ## dev: build and push
 
+### latest:
 ```
 $ docker buildx build \
     --progress plain . -t jgehrcke/nickelpie -f nickelpie.Dockerfile  && \
     docker push jgehrcke/nickelpie
-
 ...
 
 #35 DONE 0.0s
 Using default tag: latest
 The push refers to repository [docker.io/jgehrcke/nickelpie]
+```
+
+### release tag:
+```
+$ docker tag  jgehrcke/nickelpie jgehrcke/nickelpie:v25.9.12-1
+$ docker push jgehrcke/nickelpie:v25.9.12-1
 ```
 
 
