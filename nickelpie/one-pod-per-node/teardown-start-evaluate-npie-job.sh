@@ -1,18 +1,17 @@
 # kudos to
 # https://github.com/mattbryson/bash-arg-parse/blob/master/arg_parse_example
-# adjusted to _export_ vars.
+# adjusted to export vars.
 
 _script_name=$(basename "$0")
 
 function usage
 {
-    #echo "usage: ${_script_name} -a AN_ARG -s SOME_MORE_ARGS [-y YET_MORE_ARGS || -h]"
-    #echo "   ";
     echo "parameters:"
-    echo "  -a | --nodes             : A super special argument";
-    echo "  -m | --    : Another argument";
-    echo "  -y | --yet_more_args     : An optional argument";
-    echo "  -h | --help              : This message";
+    echo "  -n | --n-ranks              : todo";
+    echo "  -m | --matrix-scale         : todo";
+    echo "  -g | --gb-per-benchmark     : todo";
+    echo "  -s | --sleep-after-work     : todo";
+    echo "  -h | --help                 : This message";
 }
 
 function parse_args
@@ -23,14 +22,14 @@ function parse_args
   # named args
   while [ "$1" != "" ]; do
       case "$1" in
-          -n | --n-ranks )             export NICKELPIE_N_RANKS="$2";             shift;;
-          -m | --matrix-scale )        export NICKELPIE_MATRIX_SCALE="$2";     shift;;
-          -g | --gb-per-benchmark )    export NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK="$2";      shift;;
-          -s | --sleep-after-work )    export NICKELPIE_SLEEP_AFTER_WORK="$2";      shift;;
-          -h | --help )                usage;                   exit;; # quit and show usage
+          -n | --n-ranks )             export NICKELPIE_N_RANKS="$2"; shift;;
+          -m | --matrix-scale )        export NICKELPIE_MATRIX_SCALE="$2"; shift;;
+          -g | --gb-per-benchmark )    export NICKELPIE_SEND_TOTAL_GB_PER_BENCHMARK="$2"; shift;;
+          -s | --sleep-after-work )    export NICKELPIE_SLEEP_AFTER_WORK="$2"; shift;;
+          -h | --help )                usage;                   exit;;
           * )                          args+=("$1")             # if no match, add it to the positional args
       esac
-      shift # move to next kv pair
+      shift
   done
 
   # restore positional args
@@ -65,33 +64,18 @@ echo "NICKELPIE_SLEEP_AFTER_WORK: $NICKELPIE_SLEEP_AFTER_WORK"
 cat npie-job.yaml | envsubst > npie-job.yaml.rendered
 
 set -x
-# kubectl get resourceclaim
-# kubectl get computedomains.resource.nvidia.com
 kubectl delete -f npie-job.yaml.rendered
-kubectl delete computedomains.resource.nvidia.com nickelpie-test-compute-domain
-# wait for any previous job to complete
 
-kubectl wait --for=condition=complete --timeout=30s job/nickelpie-test
 kubectl apply -f npie-job.yaml.rendered
-
-# kubectl get resourceclaims.resource.k8s.io
 
 for RANK in $(seq 1 "$((${NICKELPIE_N_RANKS}-1))");
 do
     kubectl wait --for=condition=Ready pods -l batch.kubernetes.io/job-completion-index=${RANK},job-name=nickelpie-test --timeout=40s
 done
 
-# How were the RCs constructed? Let's inspect their anatomy.
-#kubectl get resourceclaims.resource.k8s.io
-#kubectl describe resourceclaims.resource.k8s.io $(kubectl get resourceclaims.resource.k8s.io | grep nickelpie-test | head -n1 | awk '{print $1}')
-#kubectl describe resourceclaims.resource.k8s.io $(kubectl get resourceclaims.resource.k8s.io | grep nickelpie-test | tail -n1 | awk '{print $1}')
-#kubectl get resourceclaimtemplates.resource.k8s.io
-#kubectl describe resourceclaimtemplates.resource.k8s.io $(kubectl get resourceclaimtemplates.resource.k8s.io | grep nickelpie-test | head -n1 | awk '{print $1}')
-
-
 # show node hostnames
 kubectl get pods -o wide
-sleep 5
+sleep 2
 
 set +x
 echo -e "\n\nleader (producer) log tail:"

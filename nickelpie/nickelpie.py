@@ -462,6 +462,12 @@ def log_transfer_stats(elapsed_s: float, descr: str, broadcast_factor=0):
     #   nodes: ~666 GB/s; 14 to 18 nodes: ~630 GB/s"
     # - "Allreduce should reach over 850GB/s with NVLS around 680GB/s without.
     #   A2A should hit about 630GB/s"
+    # - "One question the customer also had is if you can reach more than
+    #   ~700GB/s closer to the theoretical BW of 900GB/s per direction?" -- then
+    #   Keith Caton replies: "For NVL5?  The theoretical raw BW is closer to 800
+    #   GB/s, and we can only reach 900GB/s with AR and NVLS.  Additionally,
+    #   800GB/s is raw BW, taking into account error correction and packet
+    #   overhead, it is closer to ~700 GB/s."
     log.info("%s RESULT bandwidth: %.3f GB/s", descr, bandwidth_gib_per_second)
 
 
@@ -855,6 +861,9 @@ def log_device_properties():
                     break
 
         log.info("%s properties:\n%s", dev, pformat(printprops))
+
+    if b"MIG" in props['name']:
+        sys.exit('"MIG" in name: abort, assuming limited MNNVL capabilities')
 
 
 if __name__ == "__main__":
