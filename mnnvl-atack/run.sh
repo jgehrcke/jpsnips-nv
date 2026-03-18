@@ -12,7 +12,7 @@ fi
 
 export REPLICAS="$1"
 export CHUNK_MIB="$2"
-export POLL_INTERVAL_S="5"
+export POLL_INTERVAL_S="3"
 
 echo "--- Cleaning up previous resources (if any)"
 kubectl delete statefulset atack --ignore-not-found

@@ -147,6 +147,29 @@ def get_cd_status():
 
 
 # ---------------------------------------------------------------------------
+# Scaling
+# ---------------------------------------------------------------------------
+
+def scale_statefulset(delta):
+    """Scale atack statefulset by delta (+1 or -1). Errors go to stderr."""
+    try:
+        out = subprocess.check_output(
+            ["kubectl", "get", "statefulset", "atack",
+             "-o", "jsonpath={.spec.replicas}"],
+            stderr=subprocess.PIPE, timeout=5,
+        )
+        current = int(out.decode().strip())
+        target = max(0, current + delta)
+        subprocess.check_output(
+            ["kubectl", "scale", "statefulset", "atack",
+             f"--replicas={target}"],
+            stderr=subprocess.PIPE, timeout=5,
+        )
+    except Exception as exc:
+        print(f"scale error: {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Log follower management
 # ---------------------------------------------------------------------------
 
@@ -176,6 +199,8 @@ def status_color(status):
         return "green"
     if status in ("ContainerCreating", "Pending", "PodInitializing"):
         return "yellow"
+    if status in ("Terminated", "Succeeded"):
+        return "dim"
     return "red"
 
 
@@ -227,28 +252,36 @@ def build_cd_status_panel(cd_status):
     table.add_column("#", width=3)
     table.add_column("Node")
     table.add_column("Status")
+    table.add_column("Stale")
 
     for n in cd_status["nodes"]:
+        is_stale = n["status"] == "stale"
         color = status_color(n["status"])
-        table.add_row(str(n["index"]), n["name"],
-                      Text(n["status"], style=color))
+        stale_cell = Text("stale", style="red") if is_stale else Text("")
+        status_text = Text(n["status"], style=color) if not is_stale else Text("—", style="dim")
+        table.add_row(str(n["index"]), n["name"], status_text, stale_cell)
 
     if not cd_status["nodes"]:
-        table.add_row("—", "none", "")
+        table.add_row("—", "none", "", "")
 
     return Panel(table, title="ComputeDomain Status", title_align="left",
                  border_style="blue", padding=(0, 1))
 
 
 def build_matrix_panel(latest_matrix, pod_nodes, live_pod_indices,
-                       matrix_timestamp):
+                       matrix_timestamp, matrix_round_num, round_counter,
+                       detected_poll_s):
     title = "Bandwidth matrix (GB/s)"
 
+    parts = []
     if matrix_timestamp:
         ago = int((datetime.datetime.now() - matrix_timestamp).total_seconds())
-        subtitle = f"last update {ago}s ago"
+        parts.append(f"last update {ago}s ago")
     else:
-        subtitle = "no data yet"
+        parts.append("no data yet")
+    if detected_poll_s is not None:
+        parts.append(f"per-container poll interval ~{detected_poll_s:.1f}s")
+    subtitle = "  |  ".join(parts)
 
     cols = sorted(live_pod_indices, key=int)
     if not cols:
@@ -272,11 +305,20 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_pod_indices,
         node = shorten_node(pod_nodes.get(pod_idx, "?"))
         row_label = f"{pod_idx}-{node}"
         peers = latest_matrix.get(pod_idx, {})
+        row_round = matrix_round_num.get(pod_idx, 0)
+        # Data from current or previous round is fresh. Older is stale.
+        is_stale = round_counter - row_round > 1
 
         cells = [row_label]
         for c in cols:
             if c == pod_idx:
                 cells.append(Text("—", style="dim"))
+            elif not peers:
+                # Never reported.
+                cells.append(Text("?", style="yellow"))
+            elif is_stale:
+                val = peers.get(c, "?")
+                cells.append(Text(f"{val} !", style="dim"))
             else:
                 val = peers.get(c, "?")
                 if val == "?":
@@ -292,16 +334,27 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_pod_indices,
                  border_style="cyan")
 
 
+def build_header():
+    return Text.assemble(
+        (" U", "bold cyan"), " scale up  ",
+        ("D", "bold cyan"), " scale down  ",
+        ("Q", "bold cyan"), " quit",
+    )
+
+
 def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
-                 live_pod_indices, matrix_timestamp):
+                 live_pod_indices, matrix_timestamp, matrix_round_num,
+                 round_counter, detected_poll_s):
     mid_row_h = max(len(cd_daemons), len(cd_status["nodes"]), 1) + 4
 
     layout = Layout()
     layout.split_column(
+        Layout(name="header", size=1),
         Layout(name="pods", size=len(atack_pods) + 4),
         Layout(name="mid", size=mid_row_h),
         Layout(name="matrix"),
     )
+    layout["header"].update(build_header())
     layout["pods"].update(build_pods_table(atack_pods))
     layout["mid"].split_row(
         Layout(name="cd_daemons"),
@@ -311,7 +364,8 @@ def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
     layout["cd_status"].update(build_cd_status_panel(cd_status))
     layout["matrix"].update(
         build_matrix_panel(latest_matrix, pod_nodes, live_pod_indices,
-                           matrix_timestamp))
+                           matrix_timestamp, matrix_round_num, round_counter,
+                           detected_poll_s))
     return layout
 
 
@@ -323,8 +377,14 @@ def main():
     pod_nodes = {}
     current_round = {}
     round_start = None
-    latest_matrix = {}
+    latest_matrix = {}       # {pod_idx: {peer_idx: value_str}}
+    matrix_round_num = {}    # {pod_idx: round_number} — when each row was last updated
+    round_counter = 0
     matrix_timestamp = None
+    detected_poll_s = None      # Auto-detected poll interval from result cadence.
+    last_result_times = {}      # {pod_idx: last_result_monotonic}
+    result_count = {}           # {pod_idx: count} — skip first interval per pod
+    bootstrap_intervals = []    # Collect initial intervals, seed EMA from median
 
     atack_pods = []
     cd_daemons = []
@@ -335,10 +395,29 @@ def main():
     fd_to_pod = {}
     line_bufs = {}
 
+    # Keep recently vanished pods visible for a few seconds.
+    # {pod_key: {data, vanished_at}} where pod_key is (panel, name).
+    LINGER_S = 15.0
+    gone_pods = {}      # For atack pods: {name: {data, vanished_at}}
+    gone_cd = {}        # For CD daemons: {name: {data, vanished_at}}
+    gone_cd_nodes = {}  # For CD status nodes: {node_name: {data, vanished_at}}
+    prev_atack_names = set()
+    prev_cd_names = set()
+    prev_cd_node_names = set()
+
     last_pod_poll = 0
     last_cd_poll = 0
 
     console = Console()
+
+    # Put stdin in cbreak mode for single-keypress reading without
+    # breaking terminal output (unlike raw mode which interferes with
+    # rich's rendering).
+    old_term = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
+    stdin_fd = sys.stdin.fileno()
+    fcntl.fcntl(stdin_fd, fcntl.F_SETFL,
+                fcntl.fcntl(stdin_fd, fcntl.F_GETFL) | os.O_NONBLOCK)
 
     with Live(console=console, refresh_per_second=REFRESH_HZ,
               screen=True) as live:
@@ -346,11 +425,46 @@ def main():
             while True:
                 now = time.monotonic()
 
+                # --- Handle keyboard input ---
+                try:
+                    key = os.read(stdin_fd, 1)
+                    if key in (b"q", b"Q", b"\x03"):  # q, Q, Ctrl-C
+                        break
+                    elif key in (b"u", b"U"):
+                        scale_statefulset(+1)
+                    elif key in (b"d", b"D"):
+                        scale_statefulset(-1)
+                except (BlockingIOError, OSError):
+                    pass
+
                 # --- Poll atack pods ---
                 if now - last_pod_poll > POD_POLL_INTERVAL_S:
                     last_pod_poll = now
-                    atack_pods = get_atack_pods()
-                    live_pod_indices = set(p["idx"] for p in atack_pods)
+                    fresh_pods = get_atack_pods()
+                    fresh_names = set(p["name"] for p in fresh_pods)
+
+                    # Track newly vanished pods.
+                    for name in prev_atack_names - fresh_names:
+                        if name in gone_pods:
+                            continue
+                        # Find the last known data for this pod.
+                        for p in atack_pods:
+                            if p["name"] == name:
+                                p["status"] = "Terminated"
+                                gone_pods[name] = {"data": p, "vanished_at": now}
+                                break
+                    prev_atack_names = fresh_names
+
+                    # Expire old lingering pods.
+                    for name in list(gone_pods.keys()):
+                        if now - gone_pods[name]["vanished_at"] > LINGER_S:
+                            del gone_pods[name]
+
+                    # Combine fresh + lingering.
+                    atack_pods = fresh_pods + [g["data"] for g in gone_pods.values()]
+                    live_pod_indices = set(
+                        p["idx"] for p in fresh_pods if p["status"] == "Ready"
+                    )
 
                     current_names = set(p["name"] for p in atack_pods)
                     for pod_name in current_names - set(followers.keys()):
@@ -371,8 +485,49 @@ def main():
                 # --- Poll CD daemons and status ---
                 if now - last_cd_poll > CD_POLL_INTERVAL_S:
                     last_cd_poll = now
-                    cd_daemons = get_cd_daemons()
+                    fresh_cd = get_cd_daemons()
+                    fresh_cd_names = set(d["name"] for d in fresh_cd)
+
+                    for name in prev_cd_names - fresh_cd_names:
+                        if name in gone_cd:
+                            continue
+                        for d in cd_daemons:
+                            if d["name"] == name:
+                                d["status"] = "Terminated"
+                                gone_cd[name] = {"data": d, "vanished_at": now}
+                                break
+                    prev_cd_names = fresh_cd_names
+
+                    for name in list(gone_cd.keys()):
+                        if now - gone_cd[name]["vanished_at"] > LINGER_S:
+                            del gone_cd[name]
+
+                    cd_daemons = fresh_cd + [g["data"] for g in gone_cd.values()]
+
                     cd_status = get_cd_status()
+                    fresh_cd_node_names = set(n["name"] for n in cd_status["nodes"])
+
+                    for nname in prev_cd_node_names - fresh_cd_node_names:
+                        if nname in gone_cd_nodes:
+                            continue
+                        # Find last known data for this node.
+                        for prev_nodes in [cd_status["nodes"]]:
+                            pass  # Already gone from fresh data.
+                        # Check previous cd_status stored nodes.
+                        gone_cd_nodes[nname] = {
+                            "data": {"index": "?", "name": nname, "status": "stale"},
+                            "vanished_at": now,
+                        }
+                    prev_cd_node_names = fresh_cd_node_names
+
+                    for nname in list(gone_cd_nodes.keys()):
+                        if now - gone_cd_nodes[nname]["vanished_at"] > LINGER_S:
+                            del gone_cd_nodes[nname]
+
+                    # Merge lingering nodes into cd_status.
+                    if gone_cd_nodes:
+                        stale_nodes = [g["data"] for g in gone_cd_nodes.values()]
+                        cd_status["nodes"] = cd_status["nodes"] + stale_nodes
 
                 # --- Read log data ---
                 stdout_fds = [p.stdout for p in followers.values()
@@ -419,33 +574,69 @@ def main():
                             if round_start is None:
                                 round_start = time.monotonic()
 
+                            # Auto-detect poll interval from result cadence.
+                            # Skip first two results per pod — the initial
+                            # intervals are unreliable due to log follower
+                            # buffering and startup timing.
+                            result_now = time.monotonic()
+                            result_count[pod_idx] = result_count.get(pod_idx, 0) + 1
+                            if pod_idx in last_result_times and result_count[pod_idx] > 2:
+                                interval = result_now - last_result_times[pod_idx]
+                                if 0.5 < interval < 60:
+                                    if detected_poll_s is None:
+                                        # Collect intervals, seed from median
+                                        # once we have enough samples.
+                                        bootstrap_intervals.append(interval)
+                                        if len(bootstrap_intervals) >= 4:
+                                            s = sorted(bootstrap_intervals)
+                                            detected_poll_s = s[len(s) // 2]
+                                    else:
+                                        detected_poll_s = 0.8 * detected_poll_s + 0.2 * interval
+                            last_result_times[pod_idx] = result_now
+
                             # Round complete.
                             if (live_pod_indices and
                                     live_pod_indices
                                     <= set(current_round.keys())):
-                                latest_matrix = current_round
+                                round_counter += 1
+                                latest_matrix.update(current_round)
+                                for pod_idx in current_round:
+                                    matrix_round_num[pod_idx] = round_counter
                                 matrix_timestamp = datetime.datetime.now()
                                 current_round = {}
                                 round_start = None
 
-                # Timeout fallback.
+                # Timeout fallback: merge what we have so far.
+                # Use 3x detected poll interval, or ROUND_WINDOW_S as default.
+                round_timeout = (detected_poll_s * 3) if detected_poll_s else ROUND_WINDOW_S
                 if round_start is not None:
-                    if time.monotonic() - round_start >= ROUND_WINDOW_S:
-                        latest_matrix = current_round
+                    if time.monotonic() - round_start >= round_timeout:
+                        round_counter += 1
+                        latest_matrix.update(current_round)
+                        for pod_idx in current_round:
+                            matrix_round_num[pod_idx] = round_counter
                         matrix_timestamp = datetime.datetime.now()
                         current_round = {}
                         round_start = None
 
+                # Remove pods from matrix that are no longer live.
+                for idx in list(latest_matrix.keys()):
+                    if idx not in live_pod_indices:
+                        del latest_matrix[idx]
+                        matrix_round_num.pop(idx, None)
+
                 # --- Render ---
                 live.update(build_layout(
                     atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
-                    live_pod_indices, matrix_timestamp))
+                    live_pod_indices, matrix_timestamp, matrix_round_num,
+                    round_counter, detected_poll_s))
 
                 time.sleep(1.0 / REFRESH_HZ)
 
         except KeyboardInterrupt:
             pass
         finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
             for proc in followers.values():
                 proc.kill()
 
