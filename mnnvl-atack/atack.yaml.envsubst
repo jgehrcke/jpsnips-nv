@@ -1,0 +1,95 @@
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: atack-compute-domain
+spec:
+  numNodes: ${REPLICAS}
+  channel:
+    resourceClaimTemplate:
+      name: atack-compute-domain-rct
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-atack
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 1337
+    targetPort: 1337
+  selector:
+    app: atack
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: atack
+spec:
+  serviceName: svc-atack
+  podManagementPolicy: Parallel
+  replicas: ${REPLICAS}
+  selector:
+    matchLabels:
+      app: atack
+  template:
+    metadata:
+      labels:
+        app: atack
+    spec:
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - atack
+            topologyKey: nvidia.com/gpu.clique
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - atack
+            topologyKey: "kubernetes.io/hostname"
+      containers:
+      - name: atack
+        image: docker.io/jgehrcke/atack:latest
+        command: ["python", "/atack/atack.py"]
+        env:
+        - name: HTTPD_PORT
+          value: "1337"
+        - name: CHUNK_MIB
+          value: "${CHUNK_MIB}"
+        - name: FLOAT_VALUE
+          value: "1.0"
+        - name: SVC_NAME
+          value: "svc-atack"
+        - name: POLL_INTERVAL_S
+          value: "${POLL_INTERVAL_S}"
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 1337
+          initialDelaySeconds: 1
+          periodSeconds: 1
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          claims:
+          - name: shared-imex-channel
+      resourceClaims:
+      - name: shared-imex-channel
+        resourceClaimTemplateName: atack-compute-domain-rct
