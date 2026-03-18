@@ -1,7 +1,7 @@
 REV := $(shell git rev-parse --short=7 HEAD)
 IMAGE := docker.io/jgehrcke/atack:$(REV)
 
-.PHONY: build build-and-push build-and-push-as-latest follow-results scale-up scale-down clean
+.PHONY: build build-and-push build-and-push-as-latest dashboard scale-up scale-down clean
 
 build:
 	docker buildx build --progress plain -t $(IMAGE) .
@@ -12,8 +12,8 @@ build-and-push:
 build-and-push-as-latest: build-and-push
 	docker buildx build --progress plain -t docker.io/jgehrcke/atack:latest --push .
 
-follow-results:
-	python3 follow-results.py
+dashboard:
+	uv run dashboard.py
 
 scale-up:
 	$(eval CURRENT := $(shell kubectl get statefulset atack -o jsonpath='{.spec.replicas}'))
