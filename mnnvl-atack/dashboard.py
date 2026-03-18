@@ -197,8 +197,39 @@ def start_log_follower(pod_name):
 # ---------------------------------------------------------------------------
 
 def shorten_node(name):
+    """Default shortening: gb-nvl-156-compute15 -> compute15."""
     parts = name.split("-")
     return parts[-1] if len(parts) > 1 else name
+
+
+def compact_node_names(names):
+    """Strip the longest common prefix from a set of node names, returning
+    a dict {original: shortened}. E.g. for gb-nvl-156-compute13,
+    gb-nvl-156-compute14, gb-nvl-156-compute15 → {'...13': '13', ...}.
+    Falls back to shorten_node() if only one name."""
+    name_list = sorted(set(names))
+    if len(name_list) <= 1:
+        return {n: shorten_node(n) for n in names}
+
+    # Find longest common prefix.
+    prefix = name_list[0]
+    for n in name_list[1:]:
+        while not n.startswith(prefix):
+            prefix = prefix[:-1]
+            if not prefix:
+                break
+
+    # Strip prefix, but keep at least 2 characters.
+    max_strip = max(0, min(len(n) for n in name_list) - 2)
+    strip_len = min(len(prefix), max_strip)
+
+    result = {}
+    for n in names:
+        short = n[strip_len:]
+        if not short:
+            short = n
+        result[n] = short
+    return result
 
 
 def status_color(status):
@@ -287,7 +318,7 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
     else:
         parts.append("no data yet")
     if detected_poll_s is not None:
-        parts.append(f"per-container poll interval ~{detected_poll_s:.1f}s")
+        parts.append(f"benchmark repetition interval ~{detected_poll_s:.1f}s")
     subtitle = "  |  ".join(parts)
 
     # Matrix keys are "pod_idx-gpu_idx", e.g. "0-0", "0-1", "1-0", "1-1".
@@ -302,22 +333,32 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
                      subtitle=subtitle, subtitle_align="left",
                      border_style="cyan")
 
-    # Build column headers: "pod_idx-shortened_node-gpu_idx"
+    # Build column/row labels. For large matrices (>8 columns), use
+    # compact node names that strip the common prefix to save space.
+    all_nodes = [pod_nodes.get(c.split("-", 1)[0], "?") for c in cols]
+    if len(cols) > 8:
+        node_map = compact_node_names(all_nodes)
+    else:
+        node_map = {n: shorten_node(n) for n in all_nodes}
+
     col_headers = {}
     for c in cols:
         pod_idx, gpu_idx = c.split("-", 1)
-        node = shorten_node(pod_nodes.get(pod_idx, "?"))
+        node = node_map.get(pod_nodes.get(pod_idx, "?"), "?")
         col_headers[c] = f"{pod_idx}-{node}-{gpu_idx}"
+
+    # Adapt min column width to matrix size.
+    min_col_width = 10 if len(cols) <= 8 else 7
 
     table = Table(show_header=True, header_style="bold", box=None,
                   pad_edge=False)
     table.add_column("", style="bold")
     for c in cols:
-        table.add_column(col_headers[c], justify="right", min_width=10)
+        table.add_column(col_headers[c], justify="right", min_width=min_col_width)
 
     for row_key in cols:
         pod_idx, gpu_idx = row_key.split("-", 1)
-        node = shorten_node(pod_nodes.get(pod_idx, "?"))
+        node = node_map.get(pod_nodes.get(pod_idx, "?"), "?")
         row_label = f"{pod_idx}-{node}-{gpu_idx}"
         peers = latest_matrix.get(row_key, {})
         row_round = matrix_round_num.get(row_key, 0)
