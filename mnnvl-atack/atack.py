@@ -3,9 +3,9 @@ atack — All-to-All CUDA Kubernetes test.
 
 Tests Multi-Node NVLink (MNNVL) memory sharing using CUDA fabric handles
 exported/imported via IMEX. Each pod in a Kubernetes StatefulSet:
-- Runs an HTTP server that allocates GPU memory chunks on demand
+- Runs an HTTP server that serves pre-allocated GPU memory chunk handles
 - Periodically discovers peers via DNS and verifies cross-GPU memory access
-- Cleans up completed chunks via a GC thread
+- Supports multiple GPUs per pod for full NxM bandwidth matrix measurement
 """
 
 import base64
@@ -22,6 +22,7 @@ import time
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pprint import pformat
+from urllib.parse import urlparse, parse_qs
 
 import dns.resolver
 import requests
@@ -41,39 +42,39 @@ CHUNK_MIB = int(os.environ.get("CHUNK_MIB", "100"))
 FLOAT_VALUE = float(os.environ.get("FLOAT_VALUE", "1.0"))
 SVC_NAME = os.environ.get("SVC_NAME", "svc-atack")
 POLL_INTERVAL_S = int(os.environ.get("POLL_INTERVAL_S", "3"))
+GPUS_PER_NODE = int(os.environ.get("GPUS_PER_NODE", "1"))
 K8S_PODNAME = socket.gethostname()
 K8S_NAMESPACE = os.environ.get("POD_NAMESPACE", "default")
 K8S_NODENAME = os.environ.get("NODE_NAME", "unknown")
 
-# Pre-computed chunk metadata (JSON bytes), set once during startup.
-# A single GPU memory chunk is allocated, filled, and exported at init time.
-# The HTTP handler serves this same handle on every request — no per-request
-# GPU work. Each peer's cuMemcpyDtoD still transfers the full data over NVLink
-# every time (the handle is just an address reference, not a cached copy).
-# This eliminates GPU memory controller contention between memset fills and
-# concurrent NVLink reads from remote peers.
-SHARED_CHUNK_META = None  # JSON bytes, set by prepare_shared_chunk()
+# Per-GPU state, keyed by gpu_idx (0..GPUS_PER_NODE-1). Set during cuda_init().
+CUDEVS = {}              # {gpu_idx: CUdevice}
+ALLOC_PROPS = {}         # {gpu_idx: CUmemAllocationProp}
+GRANULARITIES = {}       # {gpu_idx: int}
+CHECKSUM_KERNELS = {}    # {gpu_idx: CUfunction}
+CHECKSUM_NUM_BLOCKS = {} # {gpu_idx: int}
 
-# Shared CUDA allocation properties (set during init).
-ALLOC_PROP = None
-GRANULARITY = None
-CUDEV = None
-CHECKSUM_KERNEL = None  # Compiled CUfunction, set during cuda_init().
+# Pre-computed chunk metadata per GPU (JSON bytes), set once during startup.
+# Each GPU gets its own chunk allocated, filled, and exported at init time.
+# The HTTP handler serves these on GET /prepare-chunk?gpu_index=N — no
+# per-request GPU work. Each peer's cuMemcpyDtoD still transfers the full
+# data over NVLink every time (the handle is just an address reference).
+SHARED_CHUNK_METAS = {}  # {gpu_idx: bytes (JSON)}
 
-# Pre-allocated GPU buffers for verify_chunk_on_gpu(), set during cuda_init().
-# Eliminates per-round cuMemAlloc/cuMemFree churn which may contribute to the
-# bandwidth measurement variance we observed (intermittent drops from ~820 to
-# ~430 GB/s). The local buffer receives the DtoD copy, the partial sums buffer
-# holds the checksum kernel output. Both are allocated once and reused.
-VERIFY_LOCAL_BUF = None       # CUdeviceptr, sized to CHUNK_MIB
-VERIFY_LOCAL_BUF_SIZE = None  # Actual allocation size in bytes
-VERIFY_PARTIALS_BUF = None    # CUdeviceptr, sized to CHECKSUM_NUM_BLOCKS * 8
+# Pre-allocated GPU buffers for verify_chunk_on_gpu(), per GPU.
+# Eliminates per-round cuMemAlloc/cuMemFree churn which may contribute to
+# bandwidth measurement variance we observed.
+VERIFY_LOCAL_BUFS = {}       # {gpu_idx: CUdeviceptr}
+VERIFY_LOCAL_BUF_SIZES = {}  # {gpu_idx: int}
+VERIFY_PARTIALS_BUFS = {}    # {gpu_idx: CUdeviceptr}
 
 
 def main():
     log.info("pod name: %s", K8S_PODNAME)
-    log.info("config: HTTPD_PORT=%s CHUNK_MIB=%s FLOAT_VALUE=%s SVC_NAME=%s POLL_INTERVAL_S=%s",
-             HTTPD_PORT, CHUNK_MIB, FLOAT_VALUE, SVC_NAME, POLL_INTERVAL_S)
+    log.info("config: HTTPD_PORT=%s CHUNK_MIB=%s FLOAT_VALUE=%s SVC_NAME=%s "
+             "POLL_INTERVAL_S=%s GPUS_PER_NODE=%s",
+             HTTPD_PORT, CHUNK_MIB, FLOAT_VALUE, SVC_NAME, POLL_INTERVAL_S,
+             GPUS_PER_NODE)
 
     log.info("cuDriverGetVersion(): %s", checkCudaErrors(driver.cuDriverGetVersion()))
     log.info(
@@ -88,7 +89,7 @@ def main():
     log_imex_state()
     cuda_init()
     log_device_properties()
-    prepare_shared_chunk()
+    prepare_all_shared_chunks()
 
     # Start threads.
     run_httpd_in_thread()
@@ -104,64 +105,70 @@ def main():
 
 
 def cuda_init():
-    """Initialize CUDA, validate single device, set up shared allocation properties."""
-    global ALLOC_PROP, GRANULARITY, CUDEV, CHECKSUM_NUM_BLOCKS
-
+    """Initialize CUDA for all GPUs: contexts, alloc properties, kernels, buffers."""
     checkCudaErrors(driver.cuInit(0))
 
-    _devcount = checkCudaErrors(runtime.cudaGetDeviceCount())
-    assert _devcount == 1, f"precisely one CUDA device expected, got {_devcount}"
-    log.info("cudaGetDeviceCount(): %s", _devcount)
+    devcount = checkCudaErrors(runtime.cudaGetDeviceCount())
+    log.info("cudaGetDeviceCount(): %s, GPUS_PER_NODE: %s", devcount, GPUS_PER_NODE)
+    assert devcount >= GPUS_PER_NODE, \
+        f"GPUS_PER_NODE={GPUS_PER_NODE} but only {devcount} devices visible"
 
-    cudev = checkCudaErrors(driver.cuDeviceGet(0))
-    CUDEV = cudev
-    log.info("cudev: %s type: %s", cudev, type(cudev))
+    for gpu_idx in range(GPUS_PER_NODE):
+        cudev = checkCudaErrors(driver.cuDeviceGet(gpu_idx))
+        CUDEVS[gpu_idx] = cudev
+        log.info("GPU %d: cudev=%s", gpu_idx, cudev)
 
-    # Use the primary context so all threads can share it via
-    # cuDevicePrimaryCtxRetain + cuCtxPushCurrent.
-    ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(cudev))
-    checkCudaErrors(driver.cuCtxPushCurrent(ctx))
-    log.info("retained and pushed primary CUDA context: %s", ctx)
+        # Each GPU has its own primary context.
+        ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(cudev))
+        checkCudaErrors(driver.cuCtxPushCurrent(ctx))
+        log.info("GPU %d: retained and pushed primary context: %s", gpu_idx, ctx)
 
-    vaddr_supported = checkCudaErrors(
-        driver.cuDeviceGetAttribute(
-            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED,
-            cudev,
+        vaddr_supported = checkCudaErrors(
+            driver.cuDeviceGetAttribute(
+                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED,
+                cudev,
+            )
         )
-    )
-    if not vaddr_supported:
-        raise Exception("VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED: false")
+        if not vaddr_supported:
+            raise Exception(f"GPU {gpu_idx}: VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED: false")
 
-    sm_count = checkCudaErrors(
-        driver.cuDeviceGetAttribute(
-            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-            cudev,
+        sm_count = checkCudaErrors(
+            driver.cuDeviceGetAttribute(
+                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                cudev,
+            )
         )
-    )
-    CHECKSUM_NUM_BLOCKS = sm_count * 4
-    log.info("SM count: %s, checksum kernel grid size: %s blocks", sm_count, CHECKSUM_NUM_BLOCKS)
+        CHECKSUM_NUM_BLOCKS[gpu_idx] = sm_count * 4
+        log.info("GPU %d: SM count: %s, checksum grid: %s blocks",
+                 gpu_idx, sm_count, CHECKSUM_NUM_BLOCKS[gpu_idx])
 
-    # Build shared allocation properties.
-    prop = driver.CUmemAllocationProp()
-    prop.location = driver.CUmemLocation()
-    prop.type = driver.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-    prop.requestedHandleTypes = (
-        driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-    )
-    prop.location.type = driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-    prop.location.id = 0
-    ALLOC_PROP = prop
-
-    GRANULARITY = checkCudaErrors(
-        driver.cuMemGetAllocationGranularity(
-            prop,
-            driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+        # Build allocation properties for this GPU.
+        prop = driver.CUmemAllocationProp()
+        prop.location = driver.CUmemLocation()
+        prop.type = driver.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.requestedHandleTypes = (
+            driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
         )
-    )
-    log.info("allocation granularity: %s bytes", GRANULARITY)
+        prop.location.type = driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+        prop.location.id = gpu_idx
+        ALLOC_PROPS[gpu_idx] = prop
 
-    compile_checksum_kernel()
-    preallocate_verify_buffers()
+        GRANULARITIES[gpu_idx] = checkCudaErrors(
+            driver.cuMemGetAllocationGranularity(
+                prop,
+                driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+            )
+        )
+        log.info("GPU %d: allocation granularity: %s bytes", gpu_idx, GRANULARITIES[gpu_idx])
+
+        # Compile checksum kernel for this GPU's context.
+        compile_checksum_kernel(gpu_idx)
+
+        # Pre-allocate verify buffers on this GPU.
+        preallocate_verify_buffers(gpu_idx)
+
+        # Pop context — we'll push per-GPU as needed.
+        checkCudaErrors(driver.cuCtxPopCurrent())
 
 
 # CUDA kernel that sums all float32 values in the input array.
@@ -220,15 +227,10 @@ void checksum(const float* __restrict__ data, int n, double* out) {
 }
 """
 
-# Number of blocks for the checksum kernel, set during cuda_init().
-# 4 blocks per SM to maximize occupancy and hide NVLink latency.
-CHECKSUM_NUM_BLOCKS = None
 
-
-def compile_checksum_kernel():
-    """Compile the checksum kernel with NVRTC and load it."""
-    global CHECKSUM_KERNEL
-
+def compile_checksum_kernel(gpu_idx):
+    """Compile the checksum kernel with NVRTC and load it. Must be called
+    with the GPU's context already pushed."""
     prog = check_nvrtc_errors(nvrtc.nvrtcCreateProgram(
         CHECKSUM_KERNEL_SRC.encode("utf-8"), b"checksum.cu", 0, [], [],
     ))
@@ -245,24 +247,25 @@ def compile_checksum_kernel():
     check_nvrtc_errors(nvrtc.nvrtcGetPTX(prog, ptx))
 
     module = checkCudaErrors(driver.cuModuleLoadData(ptx))
-    CHECKSUM_KERNEL = checkCudaErrors(driver.cuModuleGetFunction(module, b"checksum"))
-    log.info("compiled and loaded checksum kernel")
+    CHECKSUM_KERNELS[gpu_idx] = checkCudaErrors(
+        driver.cuModuleGetFunction(module, b"checksum"))
+    log.info("GPU %d: compiled and loaded checksum kernel", gpu_idx)
 
 
-def preallocate_verify_buffers():
-    """Pre-allocate GPU buffers used by verify_chunk_on_gpu()."""
-    global VERIFY_LOCAL_BUF, VERIFY_LOCAL_BUF_SIZE, VERIFY_PARTIALS_BUF
-
+def preallocate_verify_buffers(gpu_idx):
+    """Pre-allocate GPU buffers used by verify_chunk_on_gpu(). Must be called
+    with the GPU's context already pushed."""
     chunk_bytes = CHUNK_MIB * 1024 * 1024
-    alloc_size = ((chunk_bytes + GRANULARITY - 1) // GRANULARITY) * GRANULARITY
-    VERIFY_LOCAL_BUF = checkCudaErrors(driver.cuMemAlloc(alloc_size))
-    VERIFY_LOCAL_BUF_SIZE = alloc_size
+    granularity = GRANULARITIES[gpu_idx]
+    alloc_size = ((chunk_bytes + granularity - 1) // granularity) * granularity
+    VERIFY_LOCAL_BUFS[gpu_idx] = checkCudaErrors(driver.cuMemAlloc(alloc_size))
+    VERIFY_LOCAL_BUF_SIZES[gpu_idx] = alloc_size
 
-    partials_size = CHECKSUM_NUM_BLOCKS * ctypes.sizeof(ctypes.c_double)
-    VERIFY_PARTIALS_BUF = checkCudaErrors(driver.cuMemAlloc(partials_size))
+    partials_size = CHECKSUM_NUM_BLOCKS[gpu_idx] * ctypes.sizeof(ctypes.c_double)
+    VERIFY_PARTIALS_BUFS[gpu_idx] = checkCudaErrors(driver.cuMemAlloc(partials_size))
 
-    log.info("pre-allocated verify buffers: local_buf=%d bytes, partials=%d bytes",
-             alloc_size, partials_size)
+    log.info("GPU %d: pre-allocated verify buffers: local_buf=%d bytes, partials=%d bytes",
+             gpu_idx, alloc_size, partials_size)
 
 
 def check_nvrtc_errors(result):
@@ -277,50 +280,55 @@ def check_nvrtc_errors(result):
         return result[1:]
 
 
-def ensure_cuda_context():
-    """Retain and push the primary CUDA context onto the calling thread's stack.
+def ensure_cuda_context(gpu_idx):
+    """Retain and push the primary CUDA context for the given GPU onto the
+    calling thread's stack.
 
-    Safe to call multiple times from the same thread — retaining an already-retained
-    context just increments a refcount, and pushing it when it's already current is a
-    no-op in practice.
+    Safe to call multiple times — retaining an already-retained context just
+    increments a refcount.
     """
-    ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(CUDEV))
+    ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(CUDEVS[gpu_idx]))
     checkCudaErrors(driver.cuCtxPushCurrent(ctx))
 
 
-def prepare_shared_chunk():
-    """Allocate a single GPU memory chunk at startup, fill it, export the
-    fabric handle, and store the JSON metadata in SHARED_CHUNK_META.
+def pop_cuda_context():
+    """Pop the current CUDA context from the calling thread's stack."""
+    checkCudaErrors(driver.cuCtxPopCurrent())
 
-    Called once during init. The HTTP handler serves this same metadata on
-    every /prepare-chunk request. No per-request GPU work means no memset
-    can contend with concurrent NVLink reads from remote peers.
-    """
-    global SHARED_CHUNK_META
 
+def prepare_all_shared_chunks():
+    """Allocate, fill, and export a chunk on each GPU. Called once at startup."""
+    for gpu_idx in range(GPUS_PER_NODE):
+        ensure_cuda_context(gpu_idx)
+        _prepare_shared_chunk_for_gpu(gpu_idx)
+        pop_cuda_context()
+
+
+def _prepare_shared_chunk_for_gpu(gpu_idx):
+    """Prepare a single GPU's shared chunk. Context must already be pushed."""
     chunk_bytes = CHUNK_MIB * 1024 * 1024
-    alloc_size = ((chunk_bytes + GRANULARITY - 1) // GRANULARITY) * GRANULARITY
-    num_floats = alloc_size // 4  # float32
+    granularity = GRANULARITIES[gpu_idx]
+    alloc_size = ((chunk_bytes + granularity - 1) // granularity) * granularity
+    num_floats = alloc_size // 4
 
-    alloc_handle = checkCudaErrors(driver.cuMemCreate(alloc_size, ALLOC_PROP, 0))
+    alloc_handle = checkCudaErrors(
+        driver.cuMemCreate(alloc_size, ALLOC_PROPS[gpu_idx], 0))
 
-    va_ptr = checkCudaErrors(driver.cuMemAddressReserve(alloc_size, GRANULARITY, 0, 0))
+    va_ptr = checkCudaErrors(
+        driver.cuMemAddressReserve(alloc_size, granularity, 0, 0))
     checkCudaErrors(driver.cuMemMap(va_ptr, alloc_size, 0, alloc_handle, 0))
 
     access_desc = driver.CUmemAccessDesc()
-    access_desc.location = ALLOC_PROP.location
+    access_desc.location = ALLOC_PROPS[gpu_idx].location
     access_desc.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
     checkCudaErrors(driver.cuMemSetAccess(va_ptr, alloc_size, [access_desc], 1))
 
     # Fill GPU memory with FLOAT_VALUE directly on the GPU using cuMemsetD32.
-    # This avoids allocating a large host-side buffer and a PCIe host-to-device
-    # copy (cuMemcpyHtoD). cuMemsetD32 sets N 32-bit values on the device.
-    # It interprets the pattern as a uint32, so we reinterpret our float32's
-    # bit pattern as uint32 via struct pack/unpack.
+    # cuMemsetD32 interprets the pattern as a uint32, so we reinterpret our
+    # float32's bit pattern via struct pack/unpack.
     float_as_uint32 = struct.unpack("I", struct.pack("f", FLOAT_VALUE))[0]
     checkCudaErrors(driver.cuMemsetD32(va_ptr, float_as_uint32, num_floats))
-    # cuMemsetD32 is asynchronous — wait for it to complete before exporting
-    # the handle, otherwise a peer could read partially-filled memory.
+    # cuMemsetD32 is asynchronous — wait for completion before exporting.
     checkCudaErrors(driver.cuCtxSynchronize())
 
     fabric_handle = checkCudaErrors(
@@ -333,22 +341,24 @@ def prepare_shared_chunk():
 
     handle_b64 = base64.urlsafe_b64encode(fabric_handle.data).decode("ascii")
 
-    SHARED_CHUNK_META = json.dumps({
+    SHARED_CHUNK_METAS[gpu_idx] = json.dumps({
         "handle": handle_b64,
         "pod_name": K8S_PODNAME,
         "node_name": K8S_NODENAME,
+        "gpu_index": gpu_idx,
         "num_floats": num_floats,
         "float_value": FLOAT_VALUE,
         "alloc_size": alloc_size,
     }).encode("utf-8")
 
-    log.info("prepared shared chunk: %d MiB, %d floats, handle exported",
-             alloc_size // (1024 * 1024), num_floats)
+    log.info("GPU %d: prepared shared chunk: %d MiB, %d floats",
+             gpu_idx, alloc_size // (1024 * 1024), num_floats)
 
 
-def fetch_chunk_meta(peer_host: str, port: int) -> dict:
-    """GET /prepare-chunk from a peer. Returns parsed JSON metadata."""
-    resp = requests.get(f"http://{peer_host}:{port}/prepare-chunk", timeout=(5, 30))
+def fetch_chunk_meta(peer_host: str, port: int, gpu_index: int) -> dict:
+    """GET /prepare-chunk?gpu_index=N from a peer. Returns parsed JSON metadata."""
+    url = f"http://{peer_host}:{port}/prepare-chunk?gpu_index={gpu_index}"
+    resp = requests.get(url, timeout=(5, 30))
     if resp.status_code != 200:
         log.error("peer returned HTTP %s: %s", resp.status_code, resp.text)
         resp.raise_for_status()
@@ -365,15 +375,16 @@ def import_fabric_handle(handle_bytes: bytes):
     )
 
 
-def map_imported_chunk(alloc_handle, alloc_size: int) -> int:
+def map_imported_chunk(alloc_handle, alloc_size: int, gpu_idx: int) -> int:
     """Map an imported allocation into local VA space. Returns the VA pointer."""
+    granularity = GRANULARITIES[gpu_idx]
     va_ptr = checkCudaErrors(
-        driver.cuMemAddressReserve(alloc_size, GRANULARITY, 0, 0)
+        driver.cuMemAddressReserve(alloc_size, granularity, 0, 0)
     )
     checkCudaErrors(driver.cuMemMap(va_ptr, alloc_size, 0, alloc_handle, 0))
 
     access_desc = driver.CUmemAccessDesc()
-    access_desc.location = ALLOC_PROP.location
+    access_desc.location = ALLOC_PROPS[gpu_idx].location
     access_desc.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
     checkCudaErrors(driver.cuMemSetAccess(va_ptr, alloc_size, [access_desc], 1))
     return va_ptr
@@ -382,7 +393,8 @@ def map_imported_chunk(alloc_handle, alloc_size: int) -> int:
 CHECKSUM_REL_TOLERANCE = 1e-5
 
 
-def verify_chunk_on_gpu(va_ptr: int, alloc_size: int, num_floats: int, expected_value: float) -> str:
+def verify_chunk_on_gpu(local_gpu_idx: int, va_ptr: int, alloc_size: int,
+                        num_floats: int, expected_value: float) -> str:
     """Measure NVLink bandwidth via DtoD copy, then verify data via checksum.
 
     The measurement is split into two phases:
@@ -390,26 +402,25 @@ def verify_chunk_on_gpu(va_ptr: int, alloc_size: int, num_floats: int, expected_
     Phase 1 — Bandwidth measurement: cuMemcpyDtoD from the remote-mapped VA
     to a local GPU buffer. This is a pure DMA transfer handled by the copy
     engine with zero SM involvement, giving the cleanest possible NVLink
-    bandwidth number — no ALU overhead, no kernel launch latency, no
-    instruction pipeline effects. This is what NVIDIA's own bandwidth test
-    tools use.
+    bandwidth number.
 
     Phase 2 — Data integrity: run the checksum kernel on the local copy.
     Because the data is now in local GPU memory, this is a fast local read
     and does not affect the NVLink bandwidth measurement.
 
+    Context for local_gpu_idx must already be pushed.
     Returns a string like '756.3 GB/s' on success, or a mismatch description.
     """
-    assert alloc_size <= VERIFY_LOCAL_BUF_SIZE, \
-        f"chunk {alloc_size} exceeds pre-allocated buffer {VERIFY_LOCAL_BUF_SIZE}"
+    local_buf = VERIFY_LOCAL_BUFS[local_gpu_idx]
+    assert alloc_size <= VERIFY_LOCAL_BUF_SIZES[local_gpu_idx], \
+        f"chunk {alloc_size} exceeds pre-allocated buffer {VERIFY_LOCAL_BUF_SIZES[local_gpu_idx]}"
 
     # Phase 1: time the DtoD copy (pure NVLink transfer).
-    # Uses the pre-allocated local buffer — no per-round allocation.
     ev_start = checkCudaErrors(driver.cuEventCreate(0))
     ev_end = checkCudaErrors(driver.cuEventCreate(0))
 
     checkCudaErrors(driver.cuEventRecord(ev_start, 0))
-    checkCudaErrors(driver.cuMemcpyDtoD(VERIFY_LOCAL_BUF, va_ptr, alloc_size))
+    checkCudaErrors(driver.cuMemcpyDtoD(local_buf, va_ptr, alloc_size))
     checkCudaErrors(driver.cuEventRecord(ev_end, 0))
     checkCudaErrors(driver.cuEventSynchronize(ev_end))
 
@@ -418,15 +429,13 @@ def verify_chunk_on_gpu(va_ptr: int, alloc_size: int, num_floats: int, expected_
     checkCudaErrors(driver.cuEventDestroy(ev_end))
 
     # Phase 2: checksum the local copy for data integrity.
-    # Uses the pre-allocated partials buffer.
-    num_blocks = CHECKSUM_NUM_BLOCKS
+    num_blocks = CHECKSUM_NUM_BLOCKS[local_gpu_idx]
     out_size = num_blocks * ctypes.sizeof(ctypes.c_double)
+    partials_buf = VERIFY_PARTIALS_BUFS[local_gpu_idx]
 
-    # cuda-python returns CUdeviceptr wrapper objects; extract the raw
-    # integer address for ctypes kernel arg marshalling.
     n = ctypes.c_int(num_floats)
-    data_ptr = ctypes.c_void_p(int(VERIFY_LOCAL_BUF))
-    out_ptr_arg = ctypes.c_void_p(int(VERIFY_PARTIALS_BUF))
+    data_ptr = ctypes.c_void_p(int(local_buf))
+    out_ptr_arg = ctypes.c_void_p(int(partials_buf))
     args = (ctypes.c_void_p * 3)(
         ctypes.addressof(data_ptr),
         ctypes.addressof(n),
@@ -434,17 +443,16 @@ def verify_chunk_on_gpu(va_ptr: int, alloc_size: int, num_floats: int, expected_
     )
 
     checkCudaErrors(driver.cuLaunchKernel(
-        CHECKSUM_KERNEL,
-        num_blocks, 1, 1,   # grid
-        256, 1, 1,           # block
-        0, 0,                # shared mem, stream
+        CHECKSUM_KERNELS[local_gpu_idx],
+        num_blocks, 1, 1,
+        256, 1, 1,
+        0, 0,
         args, 0,
     ))
     checkCudaErrors(driver.cuCtxSynchronize())
 
-    # Read back partial sums and reduce on host.
     result_buf = bytearray(out_size)
-    checkCudaErrors(driver.cuMemcpyDtoH(result_buf, VERIFY_PARTIALS_BUF, out_size))
+    checkCudaErrors(driver.cuMemcpyDtoH(result_buf, partials_buf, out_size))
 
     partial_sums = struct.unpack(f"{num_blocks}d", result_buf)
     gpu_sum = sum(partial_sums)
@@ -473,17 +481,18 @@ def unmap_imported_chunk(va_ptr, alloc_size: int, alloc_handle):
         checkCudaErrors(driver.cuMemRelease(alloc_handle))
 
 
-
-def import_and_verify_chunk(peer_name: str, peer_host: str, port: int) -> tuple[str, str]:
-    """Request a chunk from a peer, import it, verify contents.
+def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
+                            remote_gpu_idx: int, local_gpu_idx: int) -> tuple[str, str]:
+    """Request a chunk from a specific remote GPU, import it on a specific local
+    GPU, and verify contents.
 
     Returns (result_str, peer_node_name). result_str is a bandwidth like
     '818.3 GB/s' on success, or an error string.
     """
     try:
-        meta = fetch_chunk_meta(peer_host, port)
+        meta = fetch_chunk_meta(peer_host, port, remote_gpu_idx)
     except Exception:
-        log.exception("failed to fetch chunk meta from %s:", peer_name)
+        log.exception("failed to fetch chunk meta from %s gpu %d:", peer_name, remote_gpu_idx)
         return ("req-err", "?")
 
     peer_node = meta.get("node_name", "?")
@@ -494,21 +503,26 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int) -> tuple[
     va_ptr = None
     result = "OK"
 
+    ensure_cuda_context(local_gpu_idx)
     try:
         imported_handle = import_fabric_handle(handle_bytes)
-        va_ptr = map_imported_chunk(imported_handle, alloc_size)
-        result = verify_chunk_on_gpu(va_ptr, alloc_size, meta["num_floats"], meta["float_value"])
+        va_ptr = map_imported_chunk(imported_handle, alloc_size, local_gpu_idx)
+        result = verify_chunk_on_gpu(local_gpu_idx, va_ptr, alloc_size,
+                                     meta["num_floats"], meta["float_value"])
     except CudaError:
-        log.exception("CUDA error importing/verifying chunk from %s:", peer_name)
+        log.exception("CUDA error importing/verifying chunk from %s g%d→g%d:",
+                      peer_name, remote_gpu_idx, local_gpu_idx)
         result = "cuda-err"
     except Exception:
-        log.exception("unexpected error importing/verifying chunk from %s:", peer_name)
+        log.exception("unexpected error importing/verifying chunk from %s g%d→g%d:",
+                      peer_name, remote_gpu_idx, local_gpu_idx)
         result = "err"
     finally:
         try:
             unmap_imported_chunk(va_ptr, alloc_size, imported_handle)
         except Exception:
             log.exception("cleanup error for chunk from %s:", peer_name)
+        pop_cuda_context()
 
     return (result, peer_node)
 
@@ -526,7 +540,6 @@ def discover_peers() -> list[tuple[str, str]]:
     peers = []
     for rdata in answers:
         target = str(rdata.target).rstrip(".")
-        # Extract pod name from FQDN: atack-0.svc-atack.default.svc.cluster.local
         pod_name = target.split(".")[0]
         if pod_name != K8S_PODNAME:
             peers.append((pod_name, target))
@@ -535,8 +548,11 @@ def discover_peers() -> list[tuple[str, str]]:
 
 
 def peer_poll_loop():
-    """Periodically discover peers and verify memory sharing with each."""
-    ensure_cuda_context()
+    """Periodically discover peers and verify memory sharing with each.
+
+    For each peer, iterates all remote GPU × local GPU pairs sequentially
+    in a single thread, switching CUDA contexts as needed.
+    """
     # Give the cluster a moment to settle.
     time.sleep(POLL_INTERVAL_S)
 
@@ -548,16 +564,26 @@ def peer_poll_loop():
                 time.sleep(POLL_INTERVAL_S)
                 continue
 
+            # results: { "peer_idx@peer_node-gR-gL": status }
             results = {}
+            peer_node_for_idx = {}
+
             for pod_name, peer_host in peers:
-                status, peer_node = import_and_verify_chunk(pod_name, peer_host, HTTPD_PORT)
                 peer_idx = pod_name.rsplit("-", 1)[1]
-                results[peer_idx] = (status, peer_node)
+
+                for remote_gpu_idx in range(GPUS_PER_NODE):
+                    for local_gpu_idx in range(GPUS_PER_NODE):
+                        status, peer_node = import_and_verify_chunk(
+                            pod_name, peer_host, HTTPD_PORT,
+                            remote_gpu_idx, local_gpu_idx)
+                        peer_node_for_idx[peer_idx] = peer_node
+                        key = f"{peer_idx}@{peer_node}-g{remote_gpu_idx}-g{local_gpu_idx}"
+                        results[key] = status
 
             my_idx = K8S_PODNAME.rsplit("-", 1)[1]
             parts = []
-            for idx, (status, peer_node) in sorted(results.items()):
-                parts.append(f"{idx}@{peer_node}:{status}")
+            for key, status in sorted(results.items()):
+                parts.append(f"{key}:{status}")
             log.info("result(%s@%s): %s", my_idx, K8S_NODENAME, " ".join(parts))
 
         except dns.resolver.NXDOMAIN:
@@ -571,7 +597,6 @@ def peer_poll_loop():
 def start_peer_poll_thread():
     t = threading.Thread(target=peer_poll_loop, daemon=True)
     t.start()
-
 
 
 # ---------------------------------------------------------------------------
@@ -592,14 +617,36 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"unknown path")
             return
 
-        # Serve the pre-computed shared chunk metadata — no GPU work per request.
+        # Parse gpu_index query parameter.
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        gpu_index_vals = params.get("gpu_index")
+        if not gpu_index_vals:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"missing gpu_index parameter")
+            return
+
+        try:
+            gpu_idx = int(gpu_index_vals[0])
+        except ValueError:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"invalid gpu_index")
+            return
+
+        if gpu_idx not in SHARED_CHUNK_METAS:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(f"no chunk for gpu_index={gpu_idx}".encode())
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(SHARED_CHUNK_META)
+        self.wfile.write(SHARED_CHUNK_METAS[gpu_idx])
 
     def log_message(self, format, *args):
-        # Suppress default BaseHTTPRequestHandler logging.
         pass
 
 
@@ -638,27 +685,29 @@ def log_imex_state():
 def log_device_properties():
     _attr_filter = ["name", "pci", "uuid", "multi", "minor", "major"]
 
-    devidx = checkCudaErrors(runtime.cudaGetDevice())
-    props = checkCudaErrors(runtime.cudaGetDeviceProperties(devidx))
+    for gpu_idx in range(GPUS_PER_NODE):
+        ensure_cuda_context(gpu_idx)
+        props = checkCudaErrors(runtime.cudaGetDeviceProperties(gpu_idx))
 
-    printprops = {}
-    for k in dir(props):
-        v = getattr(props, k)
-        for ss in _attr_filter:
-            if k.startswith(ss):
-                if k == "uuid":
-                    try:
-                        v = uuid.UUID(bytes=v.bytes)
-                    except ValueError:
-                        log.warning("funky UUID bytes: %s", v.bytes)
-                printprops[k] = v
-                break
+        printprops = {}
+        for k in dir(props):
+            v = getattr(props, k)
+            for ss in _attr_filter:
+                if k.startswith(ss):
+                    if k == "uuid":
+                        try:
+                            v = uuid.UUID(bytes=v.bytes)
+                        except ValueError:
+                            log.warning("funky UUID bytes: %s", v.bytes)
+                    printprops[k] = v
+                    break
 
-    log.info("device %s properties:\n%s", devidx, pformat(printprops))
+        log.info("GPU %d properties:\n%s", gpu_idx, pformat(printprops))
+        pop_cuda_context()
 
 
 # ---------------------------------------------------------------------------
-# CUDA error handling (kept from original)
+# CUDA error handling
 # ---------------------------------------------------------------------------
 
 class CudaError(RuntimeError):

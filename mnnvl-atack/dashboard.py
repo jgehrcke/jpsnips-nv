@@ -47,8 +47,15 @@ REFRESH_HZ = 5
 # Regexes for parsing result log lines
 # ---------------------------------------------------------------------------
 
+# Match: result(0@gb-nvl-156-compute14): ...
 RESULT_RE = re.compile(r"result\((\d+)@([^)]+)\):\s*(.*)")
-PEER_RE = re.compile(r"(\d+)@([^:]+):(\S+(?:\s+GB/s)?)")
+# Match: 1@node-g0-g1:818.3 GB/s (multi-GPU format)
+# Groups: peer_idx, peer_node, remote_gpu, local_gpu, value
+PEER_MULTI_RE = re.compile(
+    r"(\d+)@(.+?)-g(\d+)-g(\d+):(\S+(?:\s+GB/s)?)"
+)
+# Match: 1@node:818.3 GB/s (single-GPU backward compat)
+PEER_SINGLE_RE = re.compile(r"(\d+)@([^:]+):(\S+(?:\s+GB/s)?)")
 
 # ---------------------------------------------------------------------------
 # kubectl helpers
@@ -268,7 +275,7 @@ def build_cd_status_panel(cd_status):
                  border_style="blue", padding=(0, 1))
 
 
-def build_matrix_panel(latest_matrix, pod_nodes, live_pod_indices,
+def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
                        matrix_timestamp, matrix_round_num, round_counter,
                        detected_poll_s):
     title = "Bandwidth matrix (GB/s)"
@@ -283,38 +290,47 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_pod_indices,
         parts.append(f"per-container poll interval ~{detected_poll_s:.1f}s")
     subtitle = "  |  ".join(parts)
 
-    cols = sorted(live_pod_indices, key=int)
+    # Matrix keys are "pod_idx-gpu_idx", e.g. "0-0", "0-1", "1-0", "1-1".
+    # Sort by pod index then GPU index.
+    def sort_key(k):
+        parts = k.split("-", 1)
+        return (int(parts[0]), int(parts[1]))
+
+    cols = sorted(live_matrix_keys, key=sort_key)
     if not cols:
         return Panel("(no pods)", title=title, title_align="left",
                      subtitle=subtitle, subtitle_align="left",
                      border_style="cyan")
 
-    # Build column headers.
+    # Build column headers: "pod_idx-shortened_node-gpu_idx"
     col_headers = {}
     for c in cols:
-        node = shorten_node(pod_nodes.get(c, "?"))
-        col_headers[c] = f"{c}-{node}"
+        pod_idx, gpu_idx = c.split("-", 1)
+        node = shorten_node(pod_nodes.get(pod_idx, "?"))
+        col_headers[c] = f"{pod_idx}-{node}-{gpu_idx}"
 
     table = Table(show_header=True, header_style="bold", box=None,
                   pad_edge=False)
-    table.add_column("", style="bold")  # Row label column.
+    table.add_column("", style="bold")
     for c in cols:
         table.add_column(col_headers[c], justify="right", min_width=10)
 
-    for pod_idx in cols:
+    for row_key in cols:
+        pod_idx, gpu_idx = row_key.split("-", 1)
         node = shorten_node(pod_nodes.get(pod_idx, "?"))
-        row_label = f"{pod_idx}-{node}"
-        peers = latest_matrix.get(pod_idx, {})
-        row_round = matrix_round_num.get(pod_idx, 0)
-        # Data from current or previous round is fresh. Older is stale.
+        row_label = f"{pod_idx}-{node}-{gpu_idx}"
+        peers = latest_matrix.get(row_key, {})
+        row_round = matrix_round_num.get(row_key, 0)
         is_stale = round_counter - row_round > 1
 
+        row_pod = row_key.split("-", 1)[0]
         cells = [row_label]
         for c in cols:
-            if c == pod_idx:
+            col_pod = c.split("-", 1)[0]
+            # Same pod = intra-node pair, no cross-pod measurement.
+            if col_pod == row_pod:
                 cells.append(Text("—", style="dim"))
             elif not peers:
-                # Never reported.
                 cells.append(Text("?", style="yellow"))
             elif is_stale:
                 val = peers.get(c, "?")
@@ -343,7 +359,7 @@ def build_header():
 
 
 def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
-                 live_pod_indices, matrix_timestamp, matrix_round_num,
+                 live_matrix_keys, matrix_timestamp, matrix_round_num,
                  round_counter, detected_poll_s):
     mid_row_h = max(len(cd_daemons), len(cd_status["nodes"]), 1) + 4
 
@@ -363,7 +379,7 @@ def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
     layout["cd_daemons"].update(build_cd_table(cd_daemons))
     layout["cd_status"].update(build_cd_status_panel(cd_status))
     layout["matrix"].update(
-        build_matrix_panel(latest_matrix, pod_nodes, live_pod_indices,
+        build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
                            matrix_timestamp, matrix_round_num, round_counter,
                            detected_poll_s))
     return layout
@@ -390,6 +406,8 @@ def main():
     cd_daemons = []
     cd_status = {"overall": "?", "nodes": []}
     live_pod_indices = set()
+    live_matrix_keys = set()  # e.g. {"0-0", "0-1", "1-0", "1-1"}
+    detected_gpus_per_node = 1
 
     followers = {}
     fd_to_pod = {}
@@ -464,6 +482,10 @@ def main():
                     atack_pods = fresh_pods + [g["data"] for g in gone_pods.values()]
                     live_pod_indices = set(
                         p["idx"] for p in fresh_pods if p["status"] == "Ready"
+                    )
+                    live_matrix_keys = set(
+                        f"{idx}-{g}" for idx in live_pod_indices
+                        for g in range(detected_gpus_per_node)
                     )
 
                     current_names = set(p["name"] for p in atack_pods)
@@ -560,17 +582,52 @@ def main():
 
                             pod_nodes[pod_idx] = node_name
 
-                            peers = {}
-                            for pm in PEER_RE.finditer(raw):
-                                peer_idx = pm.group(1)
-                                peer_node = pm.group(2)
-                                val = pm.group(3)
-                                pod_nodes[peer_idx] = peer_node
-                                if val.endswith(" GB/s"):
-                                    val = val[:-5]
-                                peers[peer_idx] = val
-
-                            current_round[pod_idx] = peers
+                            # Parse peer entries. Multi-GPU format:
+                            #   1@node-g0-g1:818.3 GB/s
+                            #   → col_key="1-0" (peer+remote_gpu)
+                            #   → row_key="reporter-local_gpu"
+                            # Single-GPU fallback:
+                            #   1@node:818.3 GB/s
+                            #   → col_key="1-0", row_key="reporter-0"
+                            multi_matches = list(PEER_MULTI_RE.finditer(raw))
+                            if multi_matches:
+                                seen_gpus = set()
+                                for pm in multi_matches:
+                                    peer_idx = pm.group(1)
+                                    peer_node = pm.group(2)
+                                    remote_gpu = pm.group(3)
+                                    local_gpu = pm.group(4)
+                                    val = pm.group(5)
+                                    pod_nodes[peer_idx] = peer_node
+                                    if val.endswith(" GB/s"):
+                                        val = val[:-5]
+                                    row_key = f"{pod_idx}-{local_gpu}"
+                                    col_key = f"{peer_idx}-{remote_gpu}"
+                                    if row_key not in current_round:
+                                        current_round[row_key] = {}
+                                    current_round[row_key][col_key] = val
+                                    seen_gpus.add(int(local_gpu))
+                                    seen_gpus.add(int(remote_gpu))
+                                new_gpn = max(seen_gpus) + 1
+                                if new_gpn > detected_gpus_per_node:
+                                    detected_gpus_per_node = new_gpn
+                                    # Rebuild matrix keys with new GPU count.
+                                    live_matrix_keys = set(
+                                        f"{idx}-{g}" for idx in live_pod_indices
+                                        for g in range(detected_gpus_per_node)
+                                    )
+                            else:
+                                # Single-GPU backward compat.
+                                peers = {}
+                                for pm in PEER_SINGLE_RE.finditer(raw):
+                                    peer_idx = pm.group(1)
+                                    peer_node = pm.group(2)
+                                    val = pm.group(3)
+                                    pod_nodes[peer_idx] = peer_node
+                                    if val.endswith(" GB/s"):
+                                        val = val[:-5]
+                                    peers[f"{peer_idx}-0"] = val
+                                current_round[f"{pod_idx}-0"] = peers
                             if round_start is None:
                                 round_start = time.monotonic()
 
@@ -594,9 +651,9 @@ def main():
                                         detected_poll_s = 0.8 * detected_poll_s + 0.2 * interval
                             last_result_times[pod_idx] = result_now
 
-                            # Round complete.
-                            if (live_pod_indices and
-                                    live_pod_indices
+                            # Round complete when all matrix keys reported.
+                            if (live_matrix_keys and
+                                    live_matrix_keys
                                     <= set(current_round.keys())):
                                 round_counter += 1
                                 latest_matrix.update(current_round)
@@ -619,16 +676,16 @@ def main():
                         current_round = {}
                         round_start = None
 
-                # Remove pods from matrix that are no longer live.
-                for idx in list(latest_matrix.keys()):
-                    if idx not in live_pod_indices:
-                        del latest_matrix[idx]
-                        matrix_round_num.pop(idx, None)
+                # Remove matrix entries that are no longer live.
+                for key in list(latest_matrix.keys()):
+                    if key not in live_matrix_keys:
+                        del latest_matrix[key]
+                        matrix_round_num.pop(key, None)
 
                 # --- Render ---
                 live.update(build_layout(
                     atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
-                    live_pod_indices, matrix_timestamp, matrix_round_num,
+                    live_matrix_keys, matrix_timestamp, matrix_round_num,
                     round_counter, detected_poll_s))
 
                 time.sleep(1.0 / REFRESH_HZ)

@@ -71,6 +71,8 @@ spec:
           value: "svc-atack"
         - name: POLL_INTERVAL_S
           value: "${POLL_INTERVAL_S}"
+        - name: GPUS_PER_NODE
+          value: "${GPUS_PER_NODE}"
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
@@ -87,7 +89,7 @@ spec:
           periodSeconds: 1
         resources:
           limits:
-            nvidia.com/gpu: 1
+            nvidia.com/gpu: ${GPUS_PER_NODE}
           claims:
           - name: shared-imex-channel
       resourceClaims:
