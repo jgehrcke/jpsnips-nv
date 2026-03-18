@@ -11,6 +11,7 @@ exported/imported via IMEX. Each pod in a Kubernetes StatefulSet:
 import base64
 import ctypes
 import json
+import random
 import logging
 import os
 import signal
@@ -64,6 +65,20 @@ SHARED_CHUNK_METAS = {}  # {gpu_idx: bytes (JSON)}
 # Pre-allocated GPU buffers for verify_chunk_on_gpu(), per GPU.
 # Eliminates per-round cuMemAlloc/cuMemFree churn which may contribute to
 # bandwidth measurement variance we observed.
+# Per-GPU locks to ensure exclusive HBM access during bandwidth measurement.
+# A GPU's HBM is shared between local DtoD writes (receiving data) and remote
+# DtoD reads (serving data to other pods). Without coordination, concurrent
+# operations on the same GPU's HBM halve the measured bandwidth. Each lock
+# ensures only one benchmark uses a given GPU's HBM at a time.
+# The lock is acquired locally (for the DtoD destination GPU) and via HTTP
+# (for the remote source GPU). Remote locks auto-expire after GPU_LOCK_TIMEOUT_S
+# to handle crashed clients.
+GPU_LOCK_TIMEOUT_S = 30
+GPU_LOCK_ACQUIRE_HTTP_TIMEOUT_S = 25
+GPU_LOCKS = {}           # {gpu_idx: threading.Lock}
+GPU_LOCK_TIMESTAMPS = {} # {gpu_idx: monotonic time of last acquire}
+GPU_LOCK_TOKENS = {}     # {gpu_idx: str} — token identifying current lock holder
+
 VERIFY_LOCAL_BUFS = {}       # {gpu_idx: CUdeviceptr}
 VERIFY_LOCAL_BUF_SIZES = {}  # {gpu_idx: int}
 VERIFY_PARTIALS_BUFS = {}    # {gpu_idx: CUdeviceptr}
@@ -91,8 +106,13 @@ def main():
     log_device_properties()
     prepare_all_shared_chunks()
 
+    # Initialize per-GPU locks.
+    for gpu_idx in range(GPUS_PER_NODE):
+        GPU_LOCKS[gpu_idx] = threading.Lock()
+
     # Start threads.
     run_httpd_in_thread()
+    start_gpu_lock_watchdog()
     start_peer_poll_thread()
 
     shutdown = threading.Event()
@@ -296,6 +316,83 @@ def pop_cuda_context():
     checkCudaErrors(driver.cuCtxPopCurrent())
 
 
+def acquire_local_gpu_lock(gpu_idx):
+    """Acquire the local GPU lock, blocking until available."""
+    log.info("local lock GPU %d: acquiring", gpu_idx)
+    t0 = time.monotonic()
+    GPU_LOCKS[gpu_idx].acquire()
+    GPU_LOCK_TIMESTAMPS[gpu_idx] = time.monotonic()
+    log.info("local lock GPU %d: acquired in %.1f ms", gpu_idx,
+              (time.monotonic() - t0) * 1000)
+
+
+def release_local_gpu_lock(gpu_idx):
+    """Release the local GPU lock."""
+    try:
+        GPU_LOCKS[gpu_idx].release()
+    except RuntimeError:
+        pass  # Already released (e.g. by timeout watchdog).
+
+
+def acquire_remote_gpu_lock(peer_host: str, port: int, gpu_index: int) -> str:
+    """Acquire a GPU lock on a remote pod via HTTP. Blocks until the lock is
+    granted or times out. Returns a token that must be passed to
+    release_remote_gpu_lock."""
+    log.info("remote lock %s GPU %d: acquiring", peer_host, gpu_index)
+    t0 = time.monotonic()
+    resp = requests.post(
+        f"http://{peer_host}:{port}/lock-gpu?gpu_index={gpu_index}",
+        timeout=(1, GPU_LOCK_ACQUIRE_HTTP_TIMEOUT_S),
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"lock-gpu failed: HTTP {resp.status_code}: {resp.text}")
+    log.info("remote lock %s GPU %d: acquired in %.1f ms",
+              peer_host, gpu_index, (time.monotonic() - t0) * 1000)
+    return resp.text
+
+
+def release_remote_gpu_lock(peer_host: str, port: int, gpu_index: int,
+                            token: str):
+    """Release a GPU lock on a remote pod via HTTP. Retries up to 7 times
+    to avoid leaving a stale lock that blocks other pods for up to 30s
+    (until the watchdog force-releases it). The token ensures we don't
+    accidentally release a lock that was re-acquired by another pod."""
+    url = f"http://{peer_host}:{port}/unlock-gpu?gpu_index={gpu_index}&token={token}"
+    for attempt in range(7):
+        try:
+            requests.post(url, timeout=(1, 2))
+            return
+        except Exception as exc:
+            log.warning("failed to release remote GPU lock on %s gpu %d "
+                        "(attempt %d/7): %s", peer_host, gpu_index,
+                        attempt + 1, exc)
+            time.sleep(0.5)
+
+
+def start_gpu_lock_watchdog():
+    """Background thread that auto-releases GPU locks held longer than
+    GPU_LOCK_TIMEOUT_S. Protects against crashed remote clients that
+    acquired a lock but never released it."""
+    def watchdog():
+        while True:
+            time.sleep(1)
+            now = time.monotonic()
+            for gpu_idx in list(GPU_LOCK_TIMESTAMPS.keys()):
+                ts = GPU_LOCK_TIMESTAMPS.get(gpu_idx)
+                if ts is None:
+                    continue
+                if now - ts > GPU_LOCK_TIMEOUT_S:
+                    if GPU_LOCKS[gpu_idx].locked():
+                        log.warning("GPU lock watchdog: force-releasing GPU %d "
+                                    "(held for %.0fs)", gpu_idx, now - ts)
+                        GPU_LOCK_TOKENS.pop(gpu_idx, None)
+                        release_local_gpu_lock(gpu_idx)
+                    GPU_LOCK_TIMESTAMPS.pop(gpu_idx, None)
+
+    t = threading.Thread(target=watchdog, daemon=True)
+    t.start()
+
+
 def prepare_all_shared_chunks():
     """Allocate, fill, and export a chunk on each GPU. Called once at startup."""
     for gpu_idx in range(GPUS_PER_NODE):
@@ -466,10 +563,11 @@ def verify_chunk_on_gpu(local_gpu_idx: int, va_ptr: int, alloc_size: int,
         ok = rel_err < CHECKSUM_REL_TOLERANCE
 
     if not ok:
-        return f"CHECKSUM MISMATCH: gpu_sum={gpu_sum}, expected={expected_sum}"
+        return (f"CHECKSUM MISMATCH: gpu_sum={gpu_sum}, expected={expected_sum}",
+                elapsed_ms)
 
     bw_gbs = alloc_size / (elapsed_ms / 1000.0) / 1e9
-    return f"{bw_gbs:.1f} GB/s"
+    return (f"{bw_gbs:.1f} GB/s", elapsed_ms)
 
 
 def unmap_imported_chunk(va_ptr, alloc_size: int, alloc_handle):
@@ -507,8 +605,56 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
     try:
         imported_handle = import_fabric_handle(handle_bytes)
         va_ptr = map_imported_chunk(imported_handle, alloc_size, local_gpu_idx)
-        result = verify_chunk_on_gpu(local_gpu_idx, va_ptr, alloc_size,
-                                     meta["num_floats"], meta["float_value"])
+
+        # Acquire locks on both the remote source GPU and the local
+        # destination GPU to ensure exclusive HBM access during the timed
+        # DtoD transfer and checksum. Only the actual benchmark is locked —
+        # import/map/unmap happen outside the critical section to minimize
+        # lock hold time.
+        #
+        # IMPORTANT: to avoid deadlock, always acquire locks in a consistent
+        # global order: (pod_idx, gpu_idx) ascending. Two pods could
+        # otherwise hold each other's locks in opposite order:
+        #   Pod 0 holds local GPU1, waits for remote Pod1-GPU0
+        #   Pod 1 holds local GPU0, waits for remote Pod0-GPU1
+        # This is a classic circular wait deadlock.
+        my_idx = int(K8S_PODNAME.rsplit("-", 1)[1])
+        peer_idx_int = int(peer_name.rsplit("-", 1)[1])
+        local_key = (my_idx, local_gpu_idx)
+        remote_key = (peer_idx_int, remote_gpu_idx)
+
+        remote_token = None
+        if local_key < remote_key:
+            # Local lock first.
+            acquire_local_gpu_lock(local_gpu_idx)
+            try:
+                remote_token = acquire_remote_gpu_lock(peer_host, port, remote_gpu_idx)
+            except Exception:
+                release_local_gpu_lock(local_gpu_idx)
+                log.exception("failed to acquire remote GPU lock on %s gpu %d:",
+                              peer_name, remote_gpu_idx)
+                return ("lock-err", peer_node)
+        else:
+            # Remote lock first.
+            try:
+                remote_token = acquire_remote_gpu_lock(peer_host, port, remote_gpu_idx)
+            except Exception:
+                log.exception("failed to acquire remote GPU lock on %s gpu %d:",
+                              peer_name, remote_gpu_idx)
+                return ("lock-err", peer_node)
+            acquire_local_gpu_lock(local_gpu_idx)
+
+        try:
+            result, elapsed_ms = verify_chunk_on_gpu(
+                local_gpu_idx, va_ptr, alloc_size,
+                meta["num_floats"], meta["float_value"])
+            log.info("benchmark done %s-g%d -> local-g%d: %.1f ms, %s",
+                     peer_name, remote_gpu_idx, local_gpu_idx,
+                     elapsed_ms, result)
+        finally:
+            release_local_gpu_lock(local_gpu_idx)
+            release_remote_gpu_lock(peer_host, port, remote_gpu_idx, remote_token)
+
     except CudaError:
         log.exception("CUDA error importing/verifying chunk from %s g%d→g%d:",
                       peer_name, remote_gpu_idx, local_gpu_idx)
@@ -551,47 +697,82 @@ def peer_poll_loop():
     """Periodically discover peers and verify memory sharing with each.
 
     For each peer, iterates all remote GPU × local GPU pairs sequentially
-    in a single thread, switching CUDA contexts as needed.
+    in a single thread, switching CUDA contexts as needed. GPU locks on both
+    source and destination ensure exclusive HBM access during each DtoD
+    transfer.
+
+    Uses deadline-based scheduling: the next poll starts at a fixed interval
+    from the *start* of the previous poll, not the end. This keeps the
+    effective poll frequency stable regardless of how long each iteration
+    takes.
     """
     # Give the cluster a moment to settle.
     time.sleep(POLL_INTERVAL_S)
+    next_deadline = time.monotonic()
 
     while True:
+        next_deadline += POLL_INTERVAL_S
+        round_t0 = time.monotonic()
+
         try:
             peers = discover_peers()
             if not peers:
                 log.info("peer poll: no peers discovered yet")
-                time.sleep(POLL_INTERVAL_S)
+                _wait_until(next_deadline)
                 continue
 
             # results: { "peer_idx@peer_node-gR-gL": status }
             results = {}
             peer_node_for_idx = {}
 
-            for pod_name, peer_host in peers:
-                peer_idx = pod_name.rsplit("-", 1)[1]
-
-                for remote_gpu_idx in range(GPUS_PER_NODE):
-                    for local_gpu_idx in range(GPUS_PER_NODE):
-                        status, peer_node = import_and_verify_chunk(
-                            pod_name, peer_host, HTTPD_PORT,
-                            remote_gpu_idx, local_gpu_idx)
-                        peer_node_for_idx[peer_idx] = peer_node
-                        key = f"{peer_idx}@{peer_node}-g{remote_gpu_idx}-g{local_gpu_idx}"
-                        results[key] = status
+            # Build list of all (peer, remote_gpu, local_gpu) triples and
+            # randomize the order. This spreads lock contention across GPUs
+            # — without randomization all pods try to lock the same GPUs
+            # at the same time, creating a thundering herd.
+            work_items = [
+                (pod_name, peer_host, rg, lg)
+                for pod_name, peer_host in peers
+                for rg in range(GPUS_PER_NODE)
+                for lg in range(GPUS_PER_NODE)
+            ]
+            random.shuffle(work_items)
 
             my_idx = K8S_PODNAME.rsplit("-", 1)[1]
+            for pod_name, peer_host, remote_gpu_idx, local_gpu_idx in work_items:
+                peer_idx = pod_name.rsplit("-", 1)[1]
+                log.info("benchmark %s-g%d -> local-g%d",
+                         pod_name, remote_gpu_idx, local_gpu_idx)
+                status, peer_node = import_and_verify_chunk(
+                    pod_name, peer_host, HTTPD_PORT,
+                    remote_gpu_idx, local_gpu_idx)
+                peer_node_for_idx[peer_idx] = peer_node
+                key = f"{peer_idx}@{peer_node}-g{remote_gpu_idx}-g{local_gpu_idx}"
+                results[key] = status
+
+            round_dur = time.monotonic() - round_t0
             parts = []
             for key, status in sorted(results.items()):
                 parts.append(f"{key}:{status}")
-            log.info("result(%s@%s): %s", my_idx, K8S_NODENAME, " ".join(parts))
+            log.info("result(%s@%s): round_time=%.1fs %s",
+                     my_idx, K8S_NODENAME, round_dur, " ".join(parts))
 
         except dns.resolver.NXDOMAIN:
             log.info("peer poll: DNS name does not exist yet (expected at startup)")
         except Exception:
             log.exception("peer poll error:")
 
-        time.sleep(POLL_INTERVAL_S)
+        remaining = next_deadline - time.monotonic()
+        log.info("waiting %.1fs for next poll deadline", max(0, remaining))
+        _wait_until(next_deadline)
+
+
+def _wait_until(deadline):
+    """Sleep until the given monotonic deadline, checking every 10ms."""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 0.01))
 
 
 def start_peer_poll_thread():
@@ -645,6 +826,82 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(SHARED_CHUNK_METAS[gpu_idx])
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+
+        gpu_index_vals = params.get("gpu_index")
+        if not gpu_index_vals:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"missing gpu_index parameter")
+            return
+
+        try:
+            gpu_idx = int(gpu_index_vals[0])
+        except ValueError:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"invalid gpu_index")
+            return
+
+        if gpu_idx not in GPU_LOCKS:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(f"no GPU {gpu_idx}".encode())
+            return
+
+        if "/lock-gpu" in parsed.path:
+            # Block until the lock is available.
+            log.info("HTTPD lock-gpu %d: request from %s, waiting",
+                      gpu_idx, self.client_address[0])
+            t0 = time.monotonic()
+            acquired = GPU_LOCKS[gpu_idx].acquire(timeout=GPU_LOCK_TIMEOUT_S)
+            wait_ms = (time.monotonic() - t0) * 1000
+            if acquired:
+                log.info("HTTPD lock-gpu %d: granted to %s after %.1f ms",
+                          gpu_idx, self.client_address[0], wait_ms)
+                token = uuid.uuid4().hex[:12]
+                GPU_LOCK_TOKENS[gpu_idx] = token
+                GPU_LOCK_TIMESTAMPS[gpu_idx] = time.monotonic()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(token.encode())
+            else:
+                self.send_response(503)
+                self.end_headers()
+                self.wfile.write(b"lock acquisition timed out")
+            return
+
+        if "/unlock-gpu" in parsed.path:
+            token_vals = params.get("token")
+            token = token_vals[0] if token_vals else None
+            current_token = GPU_LOCK_TOKENS.get(gpu_idx)
+
+            if current_token is None or token == current_token:
+                # Valid unlock: token matches, or lock was already released
+                # (e.g. by watchdog). Either way, return success.
+                GPU_LOCK_TOKENS.pop(gpu_idx, None)
+                release_local_gpu_lock(gpu_idx)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"unlocked")
+            else:
+                # Token mismatch: a different holder owns this lock now.
+                # Return success anyway — the caller's lock was already
+                # released (by watchdog or timeout), and the current holder
+                # must not be disturbed.
+                log.warning("unlock-gpu %d: token mismatch (got %s, current %s), "
+                           "ignoring stale unlock", gpu_idx, token, current_token)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"stale-unlock-ignored")
+            return
+
+        self.send_response(404)
+        self.end_headers()
+        self.wfile.write(b"unknown path")
 
     def log_message(self, format, *args):
         pass
