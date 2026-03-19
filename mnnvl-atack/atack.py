@@ -222,6 +222,11 @@ def cuda_cleanup():
 
 
 def main():
+    # Reduce GIL switch interval from default 5ms to 1ms. Our HTTP handler
+    # threads need low-latency GIL access for serving lock requests and
+    # healthz probes while the poll thread does CUDA work.
+    sys.setswitchinterval(0.001)
+
     log.info("pod name: %s", K8S_PODNAME)
     log.info("config: HTTPD_PORT=%s CHUNK_MIB=%s FLOAT_VALUE=%s SVC_NAME=%s "
              "POLL_INTERVAL_S=%s GPUS_PER_NODE=%s",
@@ -1341,10 +1346,24 @@ class HTTPHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _ATACKHTTPServer(ThreadingHTTPServer):
+    # Allow many queued connections — with N pods × M GPUs, many lock
+    # requests arrive concurrently. Default of 5 causes connection refused.
+    request_queue_size = 128
+
+    # Don't wait for handler threads on shutdown.
+    daemon_threads = True
+
+    # Disable Nagle's algorithm for lower latency on small responses.
+    def server_bind(self):
+        self.socket.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+        super().server_bind()
+
+
 def run_httpd_in_thread():
     def run():
         log.info("starting HTTP server on port %s", HTTPD_PORT)
-        s = ThreadingHTTPServer(("0.0.0.0", HTTPD_PORT), HTTPHandler)
+        s = _ATACKHTTPServer(("0.0.0.0", HTTPD_PORT), HTTPHandler)
         s.serve_forever()
 
     t = threading.Thread(target=run, daemon=True)
