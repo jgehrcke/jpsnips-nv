@@ -8,11 +8,13 @@ different nodes. Uses CU_MEM_HANDLE_TYPE_FABRIC handles exported via
 IMEX for cross-node GPU memory access.
 
 Each pod:
-  - Allocates and fills GPU memory once at startup per GPU.
+  - Allocates and fills GPU memory at startup per GPU, then refreshes
+    every 30 seconds with a fresh allocation (old memory is freed). This
+    exercises the full CUDA allocation + IMEX export path regularly.
   - On each HTTP request (GET /prepare-chunk?gpu_index=N), re-exports a
     fresh CU_MEM_HANDLE_TYPE_FABRIC handle via cuMemExportToShareableHandle.
-    Re-exporting per request (rather than caching) may surface stale IMEX
-    daemon state early.
+    Both the periodic re-allocation and per-request re-export may help
+    detect or recover from degraded IMEX daemon state.
   - Periodically benchmarks every (remote_gpu, local_gpu) pair across
     all peer pods: copies data from the remote GPU to the local GPU
     via cuMemcpyDtoD (device-to-device), timed with CUDA events.
@@ -209,6 +211,7 @@ def main():
     # Start threads.
     run_httpd_in_thread()
     start_gpu_lock_watchdog()
+    threading.Thread(target=chunk_refresh_loop, daemon=True).start()
     start_peer_poll_thread()
 
     shutdown = threading.Event()
@@ -536,6 +539,9 @@ def start_gpu_lock_watchdog():
     t.start()
 
 
+CHUNK_REFRESH_INTERVAL_S = 30
+
+
 def prepare_all_shared_chunks():
     """Allocate, fill, and export a fabric handle on each local GPU.
 
@@ -549,6 +555,62 @@ def prepare_all_shared_chunks():
         ensure_cuda_context(gpu_idx)
         _prepare_shared_chunk_for_gpu(gpu_idx)
         pop_cuda_context()
+
+
+def _free_shared_chunk_for_gpu(gpu_idx):
+    """Free the old shared chunk allocation for one GPU.
+
+    Precondition: the GPU's CUDA context must be pushed.
+    """
+    old = SHARED_CHUNK_ALLOCS.get(gpu_idx)
+    if old is None:
+        return
+    va_ptr, alloc_size, alloc_handle = old
+    # Order: unmap → release handle → free VA range.
+    driver.cuMemUnmap(va_ptr, alloc_size)
+    driver.cuMemRelease(alloc_handle)
+    driver.cuMemAddressFree(va_ptr, alloc_size)
+
+
+def _refresh_shared_chunk_for_gpu(gpu_idx):
+    """Replace the shared chunk on one GPU with a fresh allocation.
+
+    Acquires the GPU lock to prevent benchmarks from reading during the
+    swap. The lock hold time is ~1-2 ms (allocate + fill + sync).
+
+    Precondition: the GPU's CUDA context must be pushed.
+
+    Raises:
+        CudaError: On allocation or memset failure.
+    """
+    acquire_local_gpu_lock(gpu_idx)
+    try:
+        _free_shared_chunk_for_gpu(gpu_idx)
+        _prepare_shared_chunk_for_gpu(gpu_idx)
+    finally:
+        release_local_gpu_lock(gpu_idx)
+
+
+def chunk_refresh_loop():
+    """Periodically replace shared chunks with fresh allocations on all GPUs.
+
+    This exercises the full CUDA allocation + IMEX export path regularly,
+    rather than relying on memory allocated once at startup. May help
+    detect or recover from degraded IMEX daemon state.
+    """
+    while True:
+        time.sleep(CHUNK_REFRESH_INTERVAL_S)
+        for gpu_idx in range(GPUS_PER_NODE):
+            t0 = time.monotonic()
+            ensure_cuda_context(gpu_idx)
+            try:
+                _refresh_shared_chunk_for_gpu(gpu_idx)
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                log.info("refreshed shared chunk on GPU %d in %.1f ms", gpu_idx, elapsed_ms)
+            except Exception:
+                log.exception("failed to refresh shared chunk on GPU %d:", gpu_idx)
+            finally:
+                pop_cuda_context()
 
 
 def _prepare_shared_chunk_for_gpu(gpu_idx):
@@ -627,10 +689,14 @@ def export_fabric_handle_for_gpu(gpu_idx) -> bytes:
         log.warning("cuMemExportToShareableHandle for GPU %d took %.1f ms",
                     gpu_idx, elapsed_ms)
 
+    # Empirically verified: cuMemExportToShareableHandle returns the same
+    # opaque byte sequence for the same underlying allocation across calls.
+    # We re-export anyway (rather than caching) because it exercises the
+    # IMEX daemon code path and may surface stale state earlier.
     handle_bytes = bytes(fabric_handle.data)
     prev = LAST_EXPORTED_HANDLE_BYTES.get(gpu_idx)
     if prev is not None and handle_bytes == prev:
-        log.info("GPU %d: re-exported handle is identical to previous", gpu_idx)
+        log.debug("GPU %d: re-exported handle is identical to previous", gpu_idx)
     LAST_EXPORTED_HANDLE_BYTES[gpu_idx] = handle_bytes
 
     handle_b64 = base64.urlsafe_b64encode(handle_bytes).decode("ascii")
