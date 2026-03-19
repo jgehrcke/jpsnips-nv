@@ -1044,6 +1044,15 @@ def _run_one_poll_round():
         log.info("round stats: DtoD min=%.1f max=%.1f mean=%.1f ms, "
                  "max_lock_wait=%.1f ms", bmin, bmax, bmean, max_lock_wait_ms)
 
+    # If the entire round completed without any CUDA errors, clear the
+    # fatal flag. This restores liveness after a transient ILLEGAL_STATE.
+    global FATAL_CUDA_ERROR
+    has_errors = any("err" in v.lower() for v in results.values())
+    if not has_errors and FATAL_CUDA_ERROR is not None:
+        log.info("round completed without errors, clearing FATAL_CUDA_ERROR "
+                 "(was: %s)", FATAL_CUDA_ERROR)
+        FATAL_CUDA_ERROR = None
+
     round_dur = time.monotonic() - round_t0
     my_idx = K8S_PODNAME.rsplit("-", 1)[1]
     parts = [f"{k}:{v}" for k, v in sorted(results.items())]

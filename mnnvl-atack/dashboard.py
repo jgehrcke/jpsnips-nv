@@ -133,7 +133,6 @@ def get_atack_pods():
                 age = "?"
         phase = item["status"].get("phase", "?")
         cstatuses = item["status"].get("containerStatuses", [])
-        liveness_failing = False
         restart_count = 0
         if cstatuses:
             cs = cstatuses[0]
@@ -147,30 +146,20 @@ def get_atack_pods():
         else:
             status = phase
 
-        # Detect liveness probe failure from pod conditions.
-        for cond in item["status"].get("conditions", []):
-            if cond.get("type") == "ContainersReady" and cond.get("status") == "False":
-                reason = cond.get("reason", "")
-                if reason:
-                    liveness_failing = True
-
-        # Also check if container was recently killed by liveness probe.
-        if cstatuses:
-            last_state = cstatuses[0].get("lastState", {})
-            terminated = last_state.get("terminated", {})
-            if terminated.get("reason") == "OOMKilled" or (
-                    terminated.get("exitCode", 0) != 0 and restart_count > 0):
-                liveness_failing = True
-
-        # Probe /healthz to detect CUDA_ERROR_ILLEGAL_STATE.
+        # Probe /healthz directly to detect CUDA_ERROR_ILLEGAL_STATE.
+        # This is the authoritative liveness signal — more reliable than
+        # inferring from pod conditions (which have false positives during
+        # startup and after restarts).
+        liveness_failing = False
         cuda_fatal = ""
         pod_ip = item["status"].get("podIP")
         if pod_ip and status == "Ready":
             try:
                 resp = requests_lib.get(f"http://{pod_ip}:1337/healthz", timeout=(0.5, 1))
-                if resp.status_code == 500 and "ILLEGAL_STATE" in resp.text:
-                    cuda_fatal = resp.text
+                if resp.status_code == 500:
                     liveness_failing = True
+                    if "ILLEGAL_STATE" in resp.text:
+                        cuda_fatal = resp.text
             except Exception:
                 pass
 
