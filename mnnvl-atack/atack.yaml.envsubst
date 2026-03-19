@@ -37,6 +37,10 @@ spec:
       labels:
         app: atack
     spec:
+      # Allow enough time for graceful shutdown: drain locks (~3s),
+      # broadcast evict-peer to peers (~20s budget, parallel), CUDA
+      # cleanup (~1s). Total ~24s, leaving ~6s margin.
+      terminationGracePeriodSeconds: 30
       affinity:
         podAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:

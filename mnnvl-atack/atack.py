@@ -158,9 +158,9 @@ SHUTTING_DOWN = threading.Event()
 # Cache of imported fabric handles and VA mappings. Avoids the expensive
 # cuMemImportFromShareableHandle + cuMemMap + cuMemSetAccess on every
 # benchmark (~35-100ms). The cache key is (local_gpu_idx, handle_bytes).
-# Entries are evicted when the handle bytes change (remote chunk refresh)
-# or when the remote peer disappears.
-# {(local_gpu_idx, handle_bytes): (imported_handle, va_ptr, alloc_size)}
+# Entries are evicted when the handle bytes change (remote chunk refresh),
+# the remote peer disappears, or the peer requests eviction during shutdown.
+# {(local_gpu_idx, handle_bytes): (imported_handle, va_ptr, alloc_size, peer_pod_name)}
 IMPORT_CACHE = {}
 
 # Shared chunk allocations tracked for cleanup on exit.
@@ -192,7 +192,7 @@ def cuda_cleanup():
 
     # Release cached imports.
     for key in list(IMPORT_CACHE.keys()):
-        imported_handle, va_ptr, alloc_size = IMPORT_CACHE.pop(key)
+        imported_handle, va_ptr, alloc_size, _peer = IMPORT_CACHE.pop(key)
         local_gpu_idx = key[0]
         try:
             ensure_cuda_context(local_gpu_idx)
@@ -307,11 +307,19 @@ def main():
     SHUTTING_DOWN.wait()
 
     # Graceful shutdown sequence:
-    # 1. SHUTTING_DOWN is set — HTTP handler now rejects /prepare-chunk
-    #    with 503 so remote pods stop acquiring our GPU locks.
+    # 1. SHUTTING_DOWN is set — HTTP handler rejects new /prepare-chunk
+    #    and /lock-gpu with 503. No new benchmarks will start using our
+    #    handles.
     # 2. Wait for any remotely-held local GPU locks to be released.
+    #    A peer holding our lock is mid-DtoD from our memory — we must
+    #    wait for that to complete before evicting.
     _wait_for_local_locks_released()
-    # 3. The poll thread checks SHUTTING_DOWN and finishes its current
+    # 3. Now no peer is actively reading our memory. Tell all peers to
+    #    evict their cached imports of our handles. The HTTP response
+    #    confirms the peer has unmapped — so when this returns, no peer
+    #    holds any reference to our GPU memory.
+    _broadcast_evict_to_peers()
+    # 4. The poll thread checks SHUTTING_DOWN and finishes its current
     #    benchmark before exiting (daemon thread, will die with process).
     log.info("graceful shutdown complete")
 
@@ -613,6 +621,62 @@ def release_remote_gpu_lock(peer_host: str, port: int, gpu_index: int,
             time.sleep(0.5)
 
 
+def _broadcast_evict_to_peers():
+    """Tell all discoverable peers to evict their cached imports of our handles.
+
+    Called during graceful shutdown, after all in-flight benchmarks have
+    completed (local locks drained). Each peer is contacted in parallel
+    with a 20s budget (15s first attempt + remaining for retry). The
+    evict-peer endpoint is idempotent — retries are safe. When a peer
+    confirms (HTTP 200), it has unmapped all our fabric handles.
+
+    Peers that don't respond in time may hit CUDA_ERROR_ILLEGAL_STATE
+    when our IMEX daemon tears down.
+    """
+    log.info("shutdown: broadcasting evict-peer to all peers")
+    try:
+        peers = discover_peers()
+    except Exception:
+        log.warning("shutdown: could not discover peers for evict broadcast")
+        return
+
+    # Send evict requests in parallel — don't let one slow peer delay
+    # the others. Each request has a 2s total budget (0.5s connect + 1.5s recv).
+    EVICT_BUDGET_S = 20  # Total time budget per peer for both attempts.
+
+    def _evict_one(pod_name, peer_host):
+        url = (f"http://{peer_host}:{HTTPD_PORT}"
+               f"/evict-peer?pod_name={K8S_PODNAME}")
+        deadline = time.monotonic() + EVICT_BUDGET_S
+        # First attempt: up to 15s recv.
+        try:
+            _http_session.post(url, timeout=(1, 15))
+            log.info("shutdown: evict-peer confirmed by %s", pod_name)
+            return
+        except Exception as exc:
+            log.warning("shutdown: evict-peer to %s attempt 1/2: %s",
+                        pod_name, exc)
+        # Second attempt: use whatever time remains.
+        remaining = deadline - time.monotonic()
+        if remaining < 0.5:
+            log.warning("shutdown: evict-peer to %s: no time for retry", pod_name)
+            return
+        try:
+            _http_session.post(url, timeout=(0.5, remaining))
+            log.info("shutdown: evict-peer confirmed by %s (attempt 2)",
+                     pod_name)
+        except Exception as exc:
+            log.warning("shutdown: evict-peer to %s failed (peer may hit "
+                        "ILLEGAL_STATE): %s", pod_name, exc)
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(peers)) as pool:
+        futures = [pool.submit(_evict_one, pn, ph) for pn, ph in peers]
+        concurrent.futures.wait(futures, timeout=EVICT_BUDGET_S + 2)
+
+    log.info("shutdown: evict broadcast complete")
+
+
 def _wait_for_local_locks_released():
     """Wait briefly for remote pods to release locks they hold on our GPUs.
 
@@ -757,7 +821,12 @@ def chunk_refresh_loop():
         SHUTTING_DOWN.wait(CHUNK_REFRESH_INTERVAL_S)
         if SHUTTING_DOWN.is_set():
             break
+        fatal_seen = False
         for gpu_idx in range(GPUS_PER_NODE):
+            if fatal_seen:
+                log.warning("skipping GPU %d refresh (ILLEGAL_STATE on earlier GPU)",
+                            gpu_idx)
+                continue
             t0 = time.monotonic()
             ensure_cuda_context(gpu_idx)
             try:
@@ -769,6 +838,14 @@ def chunk_refresh_loop():
                 else:
                     log.info("refreshed shared chunk on GPU %d in %.0f ms",
                              gpu_idx, elapsed_s * 1000)
+            except CudaError as exc:
+                elapsed_s = time.monotonic() - t0
+                log.exception("failed to refresh shared chunk on GPU %d "
+                              "(after %.1fs):", gpu_idx, elapsed_s)
+                if "ILLEGAL_STATE" in str(exc):
+                    fatal_seen = True
+                    log.warning("ILLEGAL_STATE during refresh — skipping "
+                                "remaining GPUs this cycle")
             except Exception:
                 elapsed_s = time.monotonic() - t0
                 log.exception("failed to refresh shared chunk on GPU %d "
@@ -1083,6 +1160,28 @@ def unmap_imported_chunk(va_ptr, alloc_size: int, alloc_handle):
         checkCudaErrors(driver.cuMemAddressFree(va_ptr, alloc_size))
 
 
+def evict_peer_imports(peer_pod_name):
+    """Evict all cached imports originating from the given peer.
+
+    Called when a peer announces it's shutting down, so we release its
+    fabric handles before its IMEX daemon tears down.
+    """
+    evict_keys = [k for k, v in IMPORT_CACHE.items() if v[3] == peer_pod_name]
+    for key in evict_keys:
+        imported_handle, va_ptr, alloc_size, _peer = IMPORT_CACHE.pop(key)
+        local_gpu_idx = key[0]
+        try:
+            ensure_cuda_context(local_gpu_idx)
+            unmap_imported_chunk(va_ptr, alloc_size, imported_handle)
+            pop_cuda_context()
+        except Exception:
+            log.warning("evict peer %s: cleanup failed for GPU %d (ignored)",
+                        peer_pod_name, local_gpu_idx)
+    if evict_keys:
+        log.info("evicted %d cached imports from peer %s",
+                 len(evict_keys), peer_pod_name)
+
+
 def acquire_gpu_lock_pair(peer_name, peer_host, port, remote_gpu_idx,
                           local_gpu_idx):
     """Acquire locks on both the remote source GPU and local destination GPU.
@@ -1123,7 +1222,7 @@ def acquire_gpu_lock_pair(peer_name, peer_host, port, remote_gpu_idx,
     return remote_token, max(local_wait, remote_wait)
 
 
-def _get_cached_import(local_gpu_idx, handle_bytes, alloc_size):
+def _get_cached_import(local_gpu_idx, handle_bytes, alloc_size, peer_pod_name):
     """Get or create a cached fabric handle import + VA mapping.
 
     Returns (imported_handle, va_ptr, cache_hit). If the handle bytes
@@ -1142,7 +1241,7 @@ def _get_cached_import(local_gpu_idx, handle_bytes, alloc_size):
 
     imported_handle = import_fabric_handle(handle_bytes)
     va_ptr = map_imported_chunk(imported_handle, alloc_size, local_gpu_idx)
-    IMPORT_CACHE[cache_key] = (imported_handle, va_ptr, alloc_size)
+    IMPORT_CACHE[cache_key] = (imported_handle, va_ptr, alloc_size, peer_pod_name)
     return imported_handle, va_ptr, False
 
 
@@ -1155,7 +1254,7 @@ def _evict_stale_cache_entries(active_handle_bytes):
     """
     stale_keys = [k for k in IMPORT_CACHE if k[1] not in active_handle_bytes]
     for key in stale_keys:
-        imported_handle, va_ptr, alloc_size = IMPORT_CACHE.pop(key)
+        imported_handle, va_ptr, alloc_size, peer = IMPORT_CACHE.pop(key)
         local_gpu_idx = key[0]
         try:
             ensure_cuda_context(local_gpu_idx)
@@ -1192,7 +1291,7 @@ def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
     try:
         t0 = time.monotonic()
         imported_handle, va_ptr, cache_hit = _get_cached_import(
-            local_gpu_idx, handle_bytes, alloc_size)
+            local_gpu_idx, handle_bytes, alloc_size, peer_name)
         import_map_ms = (time.monotonic() - t0) * 1000
 
         remote_token, lock_wait_ms = acquire_gpu_lock_pair(
@@ -1546,6 +1645,21 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        parsed = urlparse(self.path)
+
+        if "/evict-peer" in parsed.path:
+            params = parse_qs(parsed.query)
+            pod_name_vals = params.get("pod_name")
+            if not pod_name_vals:
+                self._respond(400, b"missing pod_name parameter")
+                return
+            pod_name = pod_name_vals[0]
+            log.info("HTTPD: evict-peer request for %s from %s",
+                     pod_name, self.client_address[0])
+            evict_peer_imports(pod_name)
+            self._respond(200, b"evicted")
+            return
+
         result = self._parse_gpu_index()
         if result is None:
             return
