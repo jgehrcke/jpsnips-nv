@@ -1,16 +1,51 @@
 """
 ATACK — All-To-All raw CUDA API-based MNNVL test runner for Kubernetes.
 
-Measures NVLink bandwidth between all GPU pairs across nodes in a
-Kubernetes StatefulSet. Uses CUDA driver API fabric handles exported
-via IMEX for cross-node GPU memory access.
+Measures NVLink bandwidth between all cross-node GPU pairs in a
+Kubernetes StatefulSet. GPUs within the same node are not benchmarked
+against each other — only pairs where source and destination are on
+different nodes. Uses CU_MEM_HANDLE_TYPE_FABRIC handles exported via
+IMEX for cross-node GPU memory access.
 
 Each pod:
-  - Pre-allocates GPU memory and exports fabric handles at startup.
-  - Serves handles via HTTP (GET /prepare-chunk?gpu_index=N).
-  - Periodically benchmarks DtoD copy bandwidth to every remote GPU.
+  - Pre-allocates GPU memory and exports fabric handles once at startup.
+  - Serves pre-exported handles via HTTP (GET /prepare-chunk?gpu_index=N).
+  - Periodically benchmarks every (remote_gpu, local_gpu) pair across
+    all peer pods: copies data from the remote GPU to the local GPU
+    via cuMemcpyDtoD (device-to-device), timed with CUDA events.
   - Coordinates exclusive HBM access via per-GPU HTTP-based locks.
   - Reports bandwidth results for consumption by the dashboard.
+
+Transfer duration is measured on-GPU via cuEventRecord before and after
+cuMemcpyDtoD, and cuEventElapsedTime to compute the interval. This
+excludes host-side overhead and reflects pure NVLink transfer time.
+
+Recommended chunk size is ~4000 MiB. Larger allocations (e.g. 10 GB)
+fail silently during cuMemcpyDtoD — likely a CUDA driver limitation
+on the maximum size of a single fabric-handle-backed allocation or
+transfer. At NVLink 5 speeds (~820 GB/s net unidirectional), a 4 GB
+transfer takes approximately 4.9 ms per benchmark.
+
+GPU locking: each benchmark transfers data from one GPU's HBM to
+another's. A GPU's HBM bandwidth is finite — if two benchmarks use the
+same GPU simultaneously (one reading from it, another writing to it),
+they share HBM bandwidth and the measurements are distorted. To prevent
+this, each GPU has a lock that must be held during the timed transfer.
+A benchmark acquires locks on both the source GPU (remote, via HTTP)
+and the destination GPU (local, in-process) before starting the copy.
+
+Three mechanisms keep the locking robust:
+  - Consistent ordering: locks are always acquired in ascending
+    (pod_index, gpu_index) order to prevent deadlock between pods that
+    would otherwise acquire each other's locks in opposite order.
+  - Tokens: the lock-gpu HTTP endpoint returns a random token. The
+    unlock-gpu endpoint only releases the lock if the token matches,
+    preventing a late retry from releasing a lock that was since
+    re-acquired by a different pod.
+  - Auto-release watchdog: a background thread force-releases any
+    remotely-acquired lock held longer than 30 seconds, guarding
+    against crashed clients that acquired a lock but never released it.
+    Local locks (held for ~5 ms) are not subject to the watchdog.
 """
 
 import atexit
@@ -54,6 +89,7 @@ GPUS_PER_NODE = int(os.environ.get("GPUS_PER_NODE", "1"))
 K8S_PODNAME = socket.gethostname()
 K8S_NAMESPACE = os.environ.get("POD_NAMESPACE", "default")
 K8S_NODENAME = os.environ.get("NODE_NAME", "unknown")
+CHECKSUM_REL_TOLERANCE = 1e-5
 
 # Per-GPU state, keyed by gpu_idx (0..GPUS_PER_NODE-1). Set during cuda_init().
 CUDEVS = {}              # {gpu_idx: CUdevice}
@@ -617,8 +653,6 @@ def map_imported_chunk(alloc_handle, alloc_size: int, gpu_idx: int) -> int:
     checkCudaErrors(driver.cuMemSetAccess(va_ptr, alloc_size, [access_desc], 1))
     return va_ptr
 
-
-CHECKSUM_REL_TOLERANCE = 1e-5
 
 
 def verify_chunk_on_gpu(local_gpu_idx: int, va_ptr: int, alloc_size: int,
