@@ -155,6 +155,14 @@ FATAL_CUDA_ERROR = None  # Set to error string on fatal error
 # Components check this to wind down cleanly.
 SHUTTING_DOWN = threading.Event()
 
+# Cache of imported fabric handles and VA mappings. Avoids the expensive
+# cuMemImportFromShareableHandle + cuMemMap + cuMemSetAccess on every
+# benchmark (~35-100ms). The cache key is (local_gpu_idx, handle_bytes).
+# Entries are evicted when the handle bytes change (remote chunk refresh)
+# or when the remote peer disappears.
+# {(local_gpu_idx, handle_bytes): (imported_handle, va_ptr, alloc_size)}
+IMPORT_CACHE = {}
+
 # Shared chunk allocations tracked for cleanup on exit.
 # {gpu_idx: (va_ptr, alloc_size, alloc_handle)}
 SHARED_CHUNK_ALLOCS = {}
@@ -180,6 +188,17 @@ def cuda_cleanup():
     CUDA driver handles cleanup at process teardown.
     """
     log.info("cuda_cleanup: releasing GPU resources")
+
+    # Release cached imports.
+    for key in list(IMPORT_CACHE.keys()):
+        imported_handle, va_ptr, alloc_size = IMPORT_CACHE.pop(key)
+        local_gpu_idx = key[0]
+        try:
+            ensure_cuda_context(local_gpu_idx)
+            unmap_imported_chunk(va_ptr, alloc_size, imported_handle)
+            pop_cuda_context()
+        except Exception as exc:
+            log.warning("cuda_cleanup: import cache entry: %s", exc)
 
     # Best-effort release of any remote GPU locks we still hold.
     # Use very short timeouts — we're in teardown and may be killed soon.
@@ -1080,6 +1099,51 @@ def acquire_gpu_lock_pair(peer_name, peer_host, port, remote_gpu_idx,
     return remote_token, max(local_wait, remote_wait)
 
 
+def _get_cached_import(local_gpu_idx, handle_bytes, alloc_size):
+    """Get or create a cached fabric handle import + VA mapping.
+
+    Returns (imported_handle, va_ptr, cache_hit). If the handle bytes
+    match a cached entry, returns the existing mapping (fast path).
+    Otherwise imports and maps fresh, caching the result.
+
+    Precondition: CUDA context for local_gpu_idx must be pushed.
+
+    Raises:
+        CudaError: On import or mapping failure.
+    """
+    cache_key = (local_gpu_idx, handle_bytes)
+    cached = IMPORT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached[0], cached[1], True
+
+    imported_handle = import_fabric_handle(handle_bytes)
+    va_ptr = map_imported_chunk(imported_handle, alloc_size, local_gpu_idx)
+    IMPORT_CACHE[cache_key] = (imported_handle, va_ptr, alloc_size)
+    return imported_handle, va_ptr, False
+
+
+def _evict_stale_cache_entries(active_handle_bytes):
+    """Remove cache entries whose handle bytes are no longer in use.
+
+    Called once per round with the set of handle bytes seen this round.
+    Entries for handles that changed (chunk refresh) or disappeared
+    (peer gone) are unmapped and freed.
+    """
+    stale_keys = [k for k in IMPORT_CACHE if k[1] not in active_handle_bytes]
+    for key in stale_keys:
+        imported_handle, va_ptr, alloc_size = IMPORT_CACHE.pop(key)
+        local_gpu_idx = key[0]
+        try:
+            ensure_cuda_context(local_gpu_idx)
+            unmap_imported_chunk(va_ptr, alloc_size, imported_handle)
+            pop_cuda_context()
+        except Exception:
+            log.warning("evict cache: cleanup failed for GPU %d (ignored)",
+                        local_gpu_idx)
+    if stale_keys:
+        log.info("evicted %d stale import cache entries", len(stale_keys))
+
+
 def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
                           handle_bytes, alloc_size, num_floats, float_value):
     """Import a remote fabric handle, map it locally, benchmark, and clean up.
@@ -1095,15 +1159,17 @@ def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
         RuntimeError: On lock acquisition failure.
     """
     peer_name = peer_host.split(".")[0]
+    t_total = time.monotonic()
+
     ensure_cuda_context(local_gpu_idx)
 
-    imported_handle = None
-    va_ptr = None
     remote_token = None
 
     try:
-        imported_handle = import_fabric_handle(handle_bytes)
-        va_ptr = map_imported_chunk(imported_handle, alloc_size, local_gpu_idx)
+        t0 = time.monotonic()
+        imported_handle, va_ptr, cache_hit = _get_cached_import(
+            local_gpu_idx, handle_bytes, alloc_size)
+        import_map_ms = (time.monotonic() - t0) * 1000
 
         remote_token, lock_wait_ms = acquire_gpu_lock_pair(
             peer_name, peer_host, port, remote_gpu_idx, local_gpu_idx)
@@ -1111,21 +1177,30 @@ def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
             result, benchmark_ms = verify_chunk_on_gpu(
                 local_gpu_idx, va_ptr, alloc_size, num_floats, float_value)
         finally:
+            t0 = time.monotonic()
             release_local_gpu_lock(local_gpu_idx)
             release_remote_gpu_lock(peer_host, port, remote_gpu_idx,
                                     remote_token)
-    finally:
-        # Guard each cleanup call individually. After CUDA_ERROR_ILLEGAL_STATE,
-        # further CUDA driver calls may segfault — catch and log rather than
-        # letting the process die.
-        try:
-            unmap_imported_chunk(va_ptr, alloc_size, imported_handle)
-        except Exception:
-            log.warning("cleanup: unmap_imported_chunk failed (ignored)")
-        try:
-            pop_cuda_context()
-        except Exception:
-            log.warning("cleanup: pop_cuda_context failed (ignored)")
+            unlock_ms = (time.monotonic() - t0) * 1000
+    except Exception:
+        # On error, evict this cache entry — the handle may be stale.
+        cache_key = (local_gpu_idx, handle_bytes)
+        evicted = IMPORT_CACHE.pop(cache_key, None)
+        if evicted:
+            try:
+                unmap_imported_chunk(evicted[1], evicted[2], evicted[0])
+            except Exception:
+                pass
+        pop_cuda_context()
+        raise
+
+    pop_cuda_context()
+
+    total_ms = (time.monotonic() - t_total) * 1000
+    log.debug("phases: import+map=%.1f%s lock_wait=%.1f DtoD=%.1f "
+              "unlock=%.1f total=%.1f ms",
+              import_map_ms, "(cached)" if cache_hit else "",
+              lock_wait_ms, benchmark_ms, unlock_ms, total_ms)
 
     return result, lock_wait_ms, benchmark_ms
 
@@ -1282,6 +1357,13 @@ def _run_one_poll_round():
 
     if not peer_metas:
         return
+
+    # Evict import cache entries for handles that changed or disappeared.
+    active_handles = set()
+    for metas in peer_metas.values():
+        for meta in metas.values():
+            active_handles.add(base64.urlsafe_b64decode(meta["handle"]))
+    _evict_stale_cache_entries(active_handles)
 
     # Benchmark all peers in parallel — one thread per peer.
     # Local GPU locks handle contention for shared local GPUs.
