@@ -36,9 +36,11 @@ import traceback
 # The log file path is printed to stderr on startup so the user knows
 # where to look.
 _dashboard_log_path = "/tmp/atack-dashboard.log"
+# Force immediate flush so crash diagnostics aren't lost in the buffer.
 _log_handler = logging.FileHandler(_dashboard_log_path, mode="w")
 _log_handler.setFormatter(logging.Formatter(
     "%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S"))
+_log_handler.stream.reconfigure(line_buffering=True)
 dlog = logging.getLogger("dashboard")
 dlog.setLevel(logging.INFO)
 dlog.addHandler(_log_handler)
@@ -752,11 +754,21 @@ def main():
     fcntl.fcntl(stdin_fd, fcntl.F_SETFL,
                 fcntl.fcntl(stdin_fd, fcntl.F_GETFL) | os.O_NONBLOCK)
 
+    last_heartbeat = 0
+
     with Live(console=console, refresh_per_second=REFRESH_HZ,
               screen=True) as live:
         try:
             while True:
                 now = time.monotonic()
+
+                # Heartbeat: log every 30s to confirm main loop is alive.
+                if now - last_heartbeat > 30:
+                    last_heartbeat = now
+                    dlog.warning("heartbeat: main loop alive, %d followers, "
+                                 "%d matrix keys",
+                                 len(followers), len(latest_matrix))
+
 
                 # --- Handle keyboard input ---
                 try:
@@ -828,7 +840,12 @@ def main():
                 stdout_fds = [p.stdout for p in followers.values()
                               if p.stdout]
                 if stdout_fds:
-                    ready, _, _ = select.select(stdout_fds, [], [], 0)
+                    try:
+                        ready, _, _ = select.select(stdout_fds, [], [], 0)
+                    except (ValueError, OSError) as exc:
+                        # Bad fd from a dead process — clean up on next check.
+                        dlog.warning("select failed: %s", exc)
+                        ready = []
                     for fd_obj in ready:
                         fd = fd_obj.fileno()
                         try:
@@ -852,6 +869,7 @@ def main():
                             pod_idx = m.group(1)
                             node_name = m.group(2)
                             raw = m.group(3)
+                            dlog.info("result line from pod %s", pod_idx)
 
                             pod_nodes[pod_idx] = node_name
                             matrix_timestamp = datetime.datetime.now()
