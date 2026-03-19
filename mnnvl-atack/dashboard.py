@@ -281,6 +281,43 @@ def get_cd_status():
     }
 
 
+def get_statefulset_info():
+    """Return StatefulSet metadata: gpus_per_node, generation, age."""
+    data = kubectl_json(["get", "statefulset", "atack"])
+    if not data:
+        return None
+    # Extract GPUS_PER_NODE from container env vars.
+    gpus = 1
+    try:
+        envs = data["spec"]["template"]["spec"]["containers"][0].get("env", [])
+        for e in envs:
+            if e.get("name") == "GPUS_PER_NODE":
+                gpus = int(e["value"])
+                break
+    except (KeyError, IndexError, ValueError):
+        dlog.warning("could not extract GPUS_PER_NODE from StatefulSet env")
+    created = data["metadata"].get("creationTimestamp", "")
+    age = ""
+    if created:
+        try:
+            ct = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+            delta = datetime.datetime.now(datetime.timezone.utc) - ct
+            secs = int(delta.total_seconds())
+            if secs < 60:
+                age = f"{secs}s"
+            elif secs < 3600:
+                age = f"{secs // 60}m{secs % 60}s"
+            else:
+                age = f"{secs // 3600}h{(secs % 3600) // 60}m"
+        except Exception:
+            age = "?"
+    return {
+        "gpus_per_node": gpus,
+        "generation": data["metadata"].get("generation", "?"),
+        "age": age,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Scaling
 # ---------------------------------------------------------------------------
@@ -473,7 +510,8 @@ MATRIX_STALE_S = 15
 
 
 def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
-                       matrix_timestamp, detected_poll_s, matrix_cell_times):
+                       matrix_timestamp, detected_poll_s, matrix_cell_times,
+                       sts_info):
     title = "Bandwidth matrix (GB/s)"
 
     parts = []
@@ -484,6 +522,9 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
         parts.append("no data yet")
     if detected_poll_s is not None:
         parts.append(f"benchmark repetition interval ~{detected_poll_s:.1f}s")
+    if sts_info:
+        parts.append(f"GPUs/node={sts_info['gpus_per_node']}")
+        parts.append(f"StatefulSet age={sts_info['age']}")
     subtitle = "  |  ".join(parts)
 
     # Matrix keys are "pod_idx-gpu_idx", e.g. "0-0", "0-1", "1-0", "1-1".
@@ -563,7 +604,7 @@ def build_header():
 
 def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
                  live_matrix_keys, matrix_timestamp, detected_poll_s,
-                 matrix_cell_times):
+                 matrix_cell_times, sts_info):
     mid_row_h = max(len(cd_daemons), len(cd_status["nodes"]), 1) + 4
 
     layout = Layout()
@@ -584,7 +625,7 @@ def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
     layout["matrix"].update(
         build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
                            matrix_timestamp, detected_poll_s,
-                           matrix_cell_times))
+                           matrix_cell_times, sts_info))
     return layout
 
 
@@ -650,9 +691,18 @@ def pods_poller(state, poll_s, linger_s):
     gone = {}
     prev_pods = []
     node_ips = {}  # {node_name: ip} — resolved once per node, persists.
+    last_sts_poll = 0
 
     while True:
         now = time.monotonic()
+
+        # Poll StatefulSet info every ~5s.
+        if now - last_sts_poll > 5:
+            last_sts_poll = now
+            try:
+                state.sts_info = get_statefulset_info()
+            except Exception as exc:
+                dlog.warning("failed to poll StatefulSet info: %s", exc)
         try:
             fresh = get_atack_pods()
         except Exception:
@@ -765,7 +815,8 @@ def main():
     LINGER_S = 15.0
 
     # Each panel has its own state object and polling thread.
-    pods_state = PanelState(pods=[], live_pod_indices=set())
+    pods_state = PanelState(pods=[], live_pod_indices=set(),
+                            sts_info=None)
     cd_daemon_state = PanelState(daemons=[])
     cd_status_state = PanelState(status={"overall": "?", "nodes": []})
 
@@ -824,9 +875,11 @@ def main():
                 # --- Read shared state from panel threads (non-blocking) ---
                 atack_pods = pods_state.pods
                 live_pod_indices = pods_state.live_pod_indices
+                sts_info = pods_state.sts_info
+                gpus_per_node = sts_info["gpus_per_node"] if sts_info else detected_gpus_per_node
                 live_matrix_keys = set(
                     f"{idx}-{g}" for idx in live_pod_indices
-                    for g in range(detected_gpus_per_node)
+                    for g in range(gpus_per_node)
                 )
 
                 # --- Manage log followers ---
@@ -1008,7 +1061,7 @@ def main():
                     display_pods, cd_daemon_state.daemons,
                     cd_status_state.status, latest_matrix, pod_nodes,
                     live_matrix_keys, matrix_timestamp, detected_poll_s,
-                    matrix_cell_times))
+                    matrix_cell_times, sts_info))
 
                 time.sleep(1.0 / REFRESH_HZ)
 
@@ -1021,12 +1074,12 @@ def main():
             try:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
             except Exception:
-                pass
+                dlog.warning("failed to restore terminal settings")
             for proc in followers.values():
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    dlog.warning("failed to kill follower process")
 
     # Print final status to stdout (visible after TUI exits).
     dlog.warning("dashboard exiting")
