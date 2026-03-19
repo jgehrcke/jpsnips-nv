@@ -598,7 +598,8 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
                 if val == "?":
                     cells.append(Text("?", style="yellow"))
                 elif any(s in val for s in ("err", "ERR", "MISMATCH",
-                         "INVALID_HANDLE", "ILLEGAL_STATE", "lock-err")):
+                         "INVALID_HANDLE", "ILLEGAL_STATE",
+                         "LAUNCH_FAILED", "lock-err")):
                     cells.append(Text(val, style="red bold"))
                 else:
                     cells.append(Text(val, style="green"))
@@ -800,33 +801,36 @@ def _pod_results_loop(state, idx, node_ip, uid, poll_s, stop_event):
         result = data.get("result") if data else None
         if result:
             age_s = result.get("age_s", 999)
-            benchmarks = result.get("benchmarks", [])
             timestamp = result.get("timestamp", "")
 
-            for b in benchmarks:
-                peer_idx = str(b["peer_idx"])
-                peer_node = b["peer_node"]
-                remote_gpu = str(b["remote_gpu"])
-                local_gpu = str(b["local_gpu"])
-                val = b["value"]
-                if val.endswith(" GB/s"):
-                    val = val[:-5]
-                row_key = f"{idx}-{local_gpu}"
-                col_key = f"{peer_idx}-{remote_gpu}"
-                if row_key not in state.matrix:
-                    state.matrix[row_key] = {}
-                state.matrix[row_key][col_key] = val
-                state.cell_times[row_key] = now
-                state.pod_nodes[idx] = data.get("node_name", "?")
-                state.pod_nodes[peer_idx] = peer_node
-
+            # Always update age (freshness indicator).
             state.last_result_times[idx] = (age_s, uid)
-            state.timestamp = datetime.datetime.now()
-            state.last_update = now
 
-            # Detect benchmark repetition interval: track when results
-            # change for this pod by comparing timestamps.
+            # Only update the matrix when the result actually changed.
             if timestamp and timestamp != prev_timestamp:
+                benchmarks = result.get("benchmarks", [])
+                for b in benchmarks:
+                    peer_idx = str(b["peer_idx"])
+                    peer_node = b["peer_node"]
+                    remote_gpu = str(b["remote_gpu"])
+                    local_gpu = str(b["local_gpu"])
+                    val = b["value"]
+                    if val.endswith(" GB/s"):
+                        val = val[:-5]
+                    row_key = f"{idx}-{local_gpu}"
+                    col_key = f"{peer_idx}-{remote_gpu}"
+                    if row_key not in state.matrix:
+                        state.matrix[row_key] = {}
+                    state.matrix[row_key][col_key] = val
+                    state.cell_times[row_key] = now
+                    state.pod_nodes[idx] = data.get("node_name", "?")
+                    state.pod_nodes[peer_idx] = peer_node
+
+                state.timestamp = datetime.datetime.now()
+                state.last_update = now
+
+                # Detect benchmark repetition interval from the time
+                # between result changes.
                 if prev_timestamp_mono is not None:
                     interval = now - prev_timestamp_mono
                     if 0.5 < interval < 120:

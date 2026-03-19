@@ -162,8 +162,6 @@ LAST_RESULT_TIME = None       # Set after ANY round (even partial).
 # Latest round result for the /results endpoint.
 LATEST_RESULT = None          # Set after each round completes.
 _LATEST_RESULT_MONO = None    # Monotonic time of LATEST_RESULT, for age_s.
-_results_generation = 0       # Bumped on each update; used for cache invalidation.
-_results_cache = None         # (generation, bytes) — cached JSON response.
 
 # Graceful shutdown coordination. Set by SIGTERM/SIGINT handler.
 # Components check this to wind down cleanly.
@@ -1580,7 +1578,7 @@ def _run_one_poll_round():
     ok_count = sum(1 for b in results
                    if not any(tag in b["value"] for tag in _error_tags))
     benchmarks_sorted = sorted(results, key=lambda b: b["key"])
-    global LATEST_RESULT, _LATEST_RESULT_MONO, _results_generation
+    global LATEST_RESULT, _LATEST_RESULT_MONO
     LATEST_RESULT = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
@@ -1591,7 +1589,6 @@ def _run_one_poll_round():
         "errors": len(results) - ok_count,
     }
     _LATEST_RESULT_MONO = time.monotonic()
-    _results_generation += 1
     my_idx = K8S_PODNAME.rsplit("-", 1)[1]
     parts = [f"{b['key']}:{b['value']}" for b in benchmarks_sorted]
     log.info("result(%s@%s): round_time=%.1fs %s",
@@ -1667,25 +1664,19 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if "/results" in self.path:
-            global _results_cache
-            gen = _results_generation
-            if _results_cache and _results_cache[0] == gen:
-                body = _results_cache[1]
-            else:
-                result = None
-                if LATEST_RESULT is not None:
-                    result = dict(LATEST_RESULT)
-                    result["age_s"] = round(
-                        time.monotonic() - _LATEST_RESULT_MONO, 1)
-                body = orjson.dumps({
-                    "pod_name": K8S_PODNAME,
-                    "node_name": K8S_NODENAME,
-                    "gpus_per_node": GPUS_PER_NODE,
-                    "result": result,
-                    "fatal_cuda_error": FATAL_CUDA_ERROR,
-                    "shutting_down": SHUTTING_DOWN.is_set(),
-                })
-                _results_cache = (gen, body)
+            result = None
+            if LATEST_RESULT is not None:
+                result = dict(LATEST_RESULT)
+                result["age_s"] = round(
+                    time.monotonic() - _LATEST_RESULT_MONO, 1)
+            body = orjson.dumps({
+                "pod_name": K8S_PODNAME,
+                "node_name": K8S_NODENAME,
+                "gpus_per_node": GPUS_PER_NODE,
+                "result": result,
+                "fatal_cuda_error": FATAL_CUDA_ERROR,
+                "shutting_down": SHUTTING_DOWN.is_set(),
+            })
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
