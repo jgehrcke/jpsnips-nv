@@ -151,6 +151,11 @@ VERIFY_PARTIALS_BUFS = {}    # {gpu_idx: CUdeviceptr}
 # unrecoverable GPU state corruption.
 FATAL_CUDA_ERROR = None  # Set to error string on fatal error
 
+# Timestamp of last successful result emission. The /healthz endpoint
+# returns 500 if no result was produced within 3× the poll interval,
+# indicating the pod is stuck (hung CUDA call, dead thread, etc.).
+LAST_RESULT_TIME = None  # Set to time.monotonic() after each successful round.
+
 # Graceful shutdown coordination. Set by SIGTERM/SIGINT handler.
 # Components check this to wind down cleanly.
 SHUTTING_DOWN = threading.Event()
@@ -1463,7 +1468,10 @@ def _run_one_poll_round():
     """
     round_t0 = time.monotonic()
     peers = discover_peers()
+    global LAST_RESULT_TIME
     if not peers:
+        # No peers, but DNS worked — we're alive, just alone.
+        LAST_RESULT_TIME = time.monotonic()
         log.info("peer poll: no peers discovered yet")
         return
 
@@ -1529,6 +1537,9 @@ def _run_one_poll_round():
         log.info("LIVENESS FLIP failing→healthy: round completed without "
                  "errors, clearing FATAL_CUDA_ERROR (was: %s)", FATAL_CUDA_ERROR)
         FATAL_CUDA_ERROR = None
+
+    global LAST_RESULT_TIME
+    LAST_RESULT_TIME = time.monotonic()
 
     round_dur = time.monotonic() - round_t0
     my_idx = K8S_PODNAME.rsplit("-", 1)[1]
@@ -1608,7 +1619,16 @@ class HTTPHandler(BaseHTTPRequestHandler):
         if "/healthz" in self.path:
             if FATAL_CUDA_ERROR:
                 self._respond(500, f"fatal: {FATAL_CUDA_ERROR}")
+            elif LAST_RESULT_TIME is not None:
+                age = time.monotonic() - LAST_RESULT_TIME
+                max_age = POLL_INTERVAL_S * 3
+                if age > max_age:
+                    self._respond(500,
+                        f"stale: no result for {age:.0f}s (max {max_age}s)")
+                else:
+                    self._respond(200, b"ok")
             else:
+                # No result yet (startup) — healthy, give it time.
                 self._respond(200, b"ok")
             return
 
