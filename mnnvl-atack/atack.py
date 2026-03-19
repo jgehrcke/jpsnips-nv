@@ -1,11 +1,16 @@
 """
-atack — All-to-All CUDA Kubernetes test.
+ATACK — All-To-All raw CUDA API-based MNNVL test runner for Kubernetes.
 
-Tests Multi-Node NVLink (MNNVL) memory sharing using CUDA fabric handles
-exported/imported via IMEX. Each pod in a Kubernetes StatefulSet:
-- Runs an HTTP server that serves pre-allocated GPU memory chunk handles
-- Periodically discovers peers via DNS and verifies cross-GPU memory access
-- Supports multiple GPUs per pod for full NxM bandwidth matrix measurement
+Measures NVLink bandwidth between all GPU pairs across nodes in a
+Kubernetes StatefulSet. Uses CUDA driver API fabric handles exported
+via IMEX for cross-node GPU memory access.
+
+Each pod:
+  - Pre-allocates GPU memory and exports fabric handles at startup.
+  - Serves handles via HTTP (GET /prepare-chunk?gpu_index=N).
+  - Periodically benchmarks DtoD copy bandwidth to every remote GPU.
+  - Coordinates exclusive HBM access via per-GPU HTTP-based locks.
+  - Reports bandwidth results for consumption by the dashboard.
 """
 
 import base64
@@ -126,7 +131,16 @@ def main():
 
 
 def cuda_init():
-    """Initialize CUDA for all GPUs: contexts, alloc properties, kernels, buffers."""
+    """Initialize CUDA runtime for all local GPUs.
+
+    For each GPU: retains its primary context, validates capabilities,
+    builds allocation properties, compiles the checksum kernel, and
+    pre-allocates verification buffers.
+
+    Raises:
+        CudaError: On any CUDA API failure.
+        AssertionError: If fewer devices are visible than GPUS_PER_NODE.
+    """
     checkCudaErrors(driver.cuInit(0))
 
     devcount = checkCudaErrors(runtime.cudaGetDeviceCount())
@@ -250,8 +264,14 @@ void checksum(const float* __restrict__ data, int n, double* out) {
 
 
 def compile_checksum_kernel(gpu_idx):
-    """Compile the checksum kernel with NVRTC and load it. Must be called
-    with the GPU's context already pushed."""
+    """Compile the checksum kernel via NVRTC and load it into the current context.
+
+    Precondition: the GPU's CUDA context must be pushed on the calling thread.
+
+    Raises:
+        RuntimeError: On NVRTC compilation failure (includes compiler log).
+        CudaError: On module load or function lookup failure.
+    """
     prog = check_nvrtc_errors(nvrtc.nvrtcCreateProgram(
         CHECKSUM_KERNEL_SRC.encode("utf-8"), b"checksum.cu", 0, [], [],
     ))
@@ -274,8 +294,17 @@ def compile_checksum_kernel(gpu_idx):
 
 
 def preallocate_verify_buffers(gpu_idx):
-    """Pre-allocate GPU buffers used by verify_chunk_on_gpu(). Must be called
-    with the GPU's context already pushed."""
+    """Pre-allocate GPU buffers used by verify_chunk_on_gpu().
+
+    Allocates a DtoD destination buffer (CHUNK_MIB) and a checksum
+    partials buffer on the given GPU. Stored in VERIFY_LOCAL_BUFS and
+    VERIFY_PARTIALS_BUFS.
+
+    Precondition: the GPU's CUDA context must be pushed on the calling thread.
+
+    Raises:
+        CudaError: On allocation failure.
+    """
     chunk_bytes = CHUNK_MIB * 1024 * 1024
     granularity = GRANULARITIES[gpu_idx]
     alloc_size = ((chunk_bytes + granularity - 1) // granularity) * granularity
@@ -290,7 +319,7 @@ def preallocate_verify_buffers(gpu_idx):
 
 
 def check_nvrtc_errors(result):
-    """Check NVRTC return codes, similar to checkCudaErrors."""
+    """Unwrap an NVRTC API result tuple. Raises RuntimeError on failure."""
     if result[0].value:
         raise RuntimeError(f"NVRTC error: {result[0]}")
     if len(result) == 1:
@@ -302,24 +331,32 @@ def check_nvrtc_errors(result):
 
 
 def ensure_cuda_context(gpu_idx):
-    """Retain and push the primary CUDA context for the given GPU onto the
-    calling thread's stack.
+    """Push the primary CUDA context for ``gpu_idx`` onto the calling thread.
 
-    Safe to call multiple times — retaining an already-retained context just
-    increments a refcount.
+    Safe to call repeatedly; retaining an already-retained context increments
+    a refcount. Must be balanced with a pop_cuda_context() call.
+
+    Raises:
+        CudaError: If the context cannot be retained or pushed.
     """
     ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(CUDEVS[gpu_idx]))
     checkCudaErrors(driver.cuCtxPushCurrent(ctx))
 
 
 def pop_cuda_context():
-    """Pop the current CUDA context from the calling thread's stack."""
+    """Pop the current CUDA context from the calling thread's stack.
+
+    Raises:
+        CudaError: If no context is active on this thread.
+    """
     checkCudaErrors(driver.cuCtxPopCurrent())
 
 
 def acquire_local_gpu_lock(gpu_idx) -> float:
     """Acquire the local GPU lock, blocking until available.
-    Returns the acquisition wait time in milliseconds."""
+
+    Returns the wall-clock wait time in milliseconds.
+    """
     log.debug("local lock GPU %d: acquiring", gpu_idx)
     t0 = time.monotonic()
     GPU_LOCKS[gpu_idx].acquire()
@@ -330,7 +367,7 @@ def acquire_local_gpu_lock(gpu_idx) -> float:
 
 
 def release_local_gpu_lock(gpu_idx):
-    """Release the local GPU lock."""
+    """Release the local GPU lock. No-op if already released."""
     try:
         GPU_LOCKS[gpu_idx].release()
     except RuntimeError:
@@ -338,8 +375,17 @@ def release_local_gpu_lock(gpu_idx):
 
 
 def acquire_remote_gpu_lock(peer_host: str, port: int, gpu_index: int) -> tuple[str, float]:
-    """Acquire a GPU lock on a remote pod via HTTP. Blocks until the lock is
-    granted or times out. Returns (token, wait_ms)."""
+    """Acquire a GPU lock on a remote pod via HTTP POST /lock-gpu.
+
+    Blocks until the remote pod grants the lock or the HTTP timeout fires.
+
+    Returns:
+        (token, wait_ms): The lock token for release, and wall-clock wait.
+
+    Raises:
+        RuntimeError: If the remote pod returns a non-200 status.
+        requests.exceptions.RequestException: On connection or timeout failure.
+    """
     log.debug("remote lock %s GPU %d: acquiring", peer_host, gpu_index)
     t0 = time.monotonic()
     resp = requests.post(
@@ -356,10 +402,14 @@ def acquire_remote_gpu_lock(peer_host: str, port: int, gpu_index: int) -> tuple[
 
 def release_remote_gpu_lock(peer_host: str, port: int, gpu_index: int,
                             token: str):
-    """Release a GPU lock on a remote pod via HTTP. Retries up to 7 times
-    to avoid leaving a stale lock that blocks other pods for up to 30s
-    (until the watchdog force-releases it). The token ensures we don't
-    accidentally release a lock that was re-acquired by another pod."""
+    """Release a GPU lock on a remote pod via HTTP POST /unlock-gpu.
+
+    Retries up to 7 times (0.5s apart) to avoid leaving a stale lock that
+    blocks other pods until the watchdog force-releases it. The token
+    prevents accidentally releasing a lock re-acquired by another pod.
+
+    Never raises — failures are logged as warnings.
+    """
     url = f"http://{peer_host}:{port}/unlock-gpu?gpu_index={gpu_index}&token={token}"
     for attempt in range(7):
         try:
@@ -373,9 +423,9 @@ def release_remote_gpu_lock(peer_host: str, port: int, gpu_index: int,
 
 
 def start_gpu_lock_watchdog():
-    """Background thread that auto-releases GPU locks held longer than
-    GPU_LOCK_TIMEOUT_S. Protects against crashed remote clients that
-    acquired a lock but never released it."""
+    """Start a daemon thread that force-releases GPU locks held longer than
+    GPU_LOCK_TIMEOUT_S. Guards against crashed remote clients that acquired
+    a lock via HTTP but never released it."""
     def watchdog():
         while True:
             time.sleep(1)
@@ -397,7 +447,13 @@ def start_gpu_lock_watchdog():
 
 
 def prepare_all_shared_chunks():
-    """Allocate, fill, and export a chunk on each GPU. Called once at startup."""
+    """Allocate, fill, and export a fabric handle on each local GPU.
+
+    Called once at startup. Populates SHARED_CHUNK_METAS.
+
+    Raises:
+        CudaError: On any GPU allocation, fill, or export failure.
+    """
     for gpu_idx in range(GPUS_PER_NODE):
         ensure_cuda_context(gpu_idx)
         _prepare_shared_chunk_for_gpu(gpu_idx)
@@ -405,7 +461,13 @@ def prepare_all_shared_chunks():
 
 
 def _prepare_shared_chunk_for_gpu(gpu_idx):
-    """Prepare a single GPU's shared chunk. Context must already be pushed."""
+    """Allocate, fill, and export a fabric handle for one GPU.
+
+    Precondition: the GPU's CUDA context must be pushed.
+
+    Raises:
+        CudaError: On allocation, memset, or handle export failure.
+    """
     chunk_bytes = CHUNK_MIB * 1024 * 1024
     granularity = GRANULARITIES[gpu_idx]
     alloc_size = ((chunk_bytes + granularity - 1) // granularity) * granularity
@@ -456,7 +518,12 @@ def _prepare_shared_chunk_for_gpu(gpu_idx):
 
 
 def fetch_chunk_meta(peer_host: str, port: int, gpu_index: int) -> dict:
-    """GET /prepare-chunk?gpu_index=N from a peer. Returns parsed JSON metadata."""
+    """Fetch chunk metadata from a peer pod via GET /prepare-chunk?gpu_index=N.
+
+    Raises:
+        requests.exceptions.HTTPError: On non-200 response.
+        requests.exceptions.RequestException: On connection or timeout failure.
+    """
     url = f"http://{peer_host}:{port}/prepare-chunk?gpu_index={gpu_index}"
     resp = requests.get(url, timeout=(5, 30))
     if resp.status_code != 200:
@@ -466,7 +533,11 @@ def fetch_chunk_meta(peer_host: str, port: int, gpu_index: int) -> dict:
 
 
 def import_fabric_handle(handle_bytes: bytes):
-    """Import a fabric handle and return the local allocation handle."""
+    """Import a CUDA fabric handle from raw bytes.
+
+    Raises:
+        CudaError: If the handle cannot be imported.
+    """
     return checkCudaErrors(
         driver.cuMemImportFromShareableHandle(
             handle_bytes,
@@ -476,7 +547,11 @@ def import_fabric_handle(handle_bytes: bytes):
 
 
 def map_imported_chunk(alloc_handle, alloc_size: int, gpu_idx: int) -> int:
-    """Map an imported allocation into local VA space. Returns the VA pointer."""
+    """Map an imported allocation into the local GPU's VA space.
+
+    Raises:
+        CudaError: On address reservation, mapping, or access control failure.
+    """
     granularity = GRANULARITIES[gpu_idx]
     va_ptr = checkCudaErrors(
         driver.cuMemAddressReserve(alloc_size, granularity, 0, 0)
@@ -494,22 +569,26 @@ CHECKSUM_REL_TOLERANCE = 1e-5
 
 
 def verify_chunk_on_gpu(local_gpu_idx: int, va_ptr: int, alloc_size: int,
-                        num_floats: int, expected_value: float) -> str:
-    """Measure NVLink bandwidth via DtoD copy, then verify data via checksum.
+                        num_floats: int, expected_value: float) -> tuple[str, float]:
+    """Measure NVLink bandwidth and verify data integrity for a mapped chunk.
 
-    The measurement is split into two phases:
+    Phase 1 — cuMemcpyDtoD from the remote-mapped VA to a pre-allocated
+    local buffer. Timed via CUDA events. This is a pure DMA copy engine
+    transfer with no SM involvement, yielding a clean NVLink bandwidth
+    measurement.
 
-    Phase 1 — Bandwidth measurement: cuMemcpyDtoD from the remote-mapped VA
-    to a local GPU buffer. This is a pure DMA transfer handled by the copy
-    engine with zero SM involvement, giving the cleanest possible NVLink
-    bandwidth number.
+    Phase 2 — Checksum kernel on the local copy. Verifies data integrity
+    without affecting the bandwidth measurement (local memory read only).
 
-    Phase 2 — Data integrity: run the checksum kernel on the local copy.
-    Because the data is now in local GPU memory, this is a fast local read
-    and does not affect the NVLink bandwidth measurement.
+    Precondition: CUDA context for local_gpu_idx must be pushed.
 
-    Context for local_gpu_idx must already be pushed.
-    Returns a string like '756.3 GB/s' on success, or a mismatch description.
+    Returns:
+        (result_str, elapsed_ms): Bandwidth string like '818.5 GB/s' or a
+        CHECKSUM MISMATCH description, plus the raw DtoD transfer time.
+
+    Raises:
+        CudaError: On any CUDA operation failure.
+        AssertionError: If alloc_size exceeds the pre-allocated buffer.
     """
     local_buf = VERIFY_LOCAL_BUFS[local_gpu_idx]
     assert alloc_size <= VERIFY_LOCAL_BUF_SIZES[local_gpu_idx], \
@@ -574,7 +653,13 @@ def verify_chunk_on_gpu(local_gpu_idx: int, va_ptr: int, alloc_size: int,
 
 
 def unmap_imported_chunk(va_ptr, alloc_size: int, alloc_handle):
-    """Unmap and release a locally-imported GPU memory chunk."""
+    """Unmap and release a locally-imported GPU memory chunk.
+
+    Safe to call with None arguments (no-ops for cleanup convenience).
+
+    Raises:
+        CudaError: On unmap, address free, or release failure.
+    """
     if va_ptr is not None:
         checkCudaErrors(driver.cuMemUnmap(va_ptr, alloc_size))
         checkCudaErrors(driver.cuMemAddressFree(va_ptr, alloc_size))
@@ -584,11 +669,18 @@ def unmap_imported_chunk(va_ptr, alloc_size: int, alloc_handle):
 
 def acquire_gpu_lock_pair(peer_name, peer_host, port, remote_gpu_idx,
                           local_gpu_idx):
-    """Acquire locks on both remote source GPU and local destination GPU.
+    """Acquire locks on both the remote source GPU and local destination GPU.
 
-    Uses consistent global ordering by (pod_idx, gpu_idx) to avoid deadlock.
-    May raise RuntimeError if the remote lock cannot be acquired.
-    Returns (remote_token, lock_wait_ms).
+    Locks are always acquired in ascending (pod_idx, gpu_idx) order to
+    prevent deadlock between pods that would otherwise acquire each
+    other's locks in opposite order.
+
+    Returns:
+        (remote_token, lock_wait_ms): Token for remote unlock, max wait time.
+
+    Raises:
+        RuntimeError: If the remote lock HTTP request fails.
+        requests.exceptions.RequestException: On connection/timeout failure.
     """
     my_idx = int(K8S_PODNAME.rsplit("-", 1)[1])
     peer_idx_int = int(peer_name.rsplit("-", 1)[1])
@@ -613,11 +705,17 @@ def acquire_gpu_lock_pair(peer_name, peer_host, port, remote_gpu_idx,
 
 def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
                           handle_bytes, alloc_size, num_floats, float_value):
-    """Import a fabric handle, map it, run the locked benchmark, clean up.
+    """Import a remote fabric handle, map it locally, benchmark, and clean up.
 
-    Manages CUDA context push/pop and lock acquire/release internally.
-    May raise CudaError or RuntimeError.
-    Returns (result_str, lock_wait_ms, benchmark_ms).
+    Manages CUDA context push/pop, lock acquire/release, and VA
+    unmap/release internally. Caller must not hold any GPU locks.
+
+    Returns:
+        (result_str, lock_wait_ms, benchmark_ms).
+
+    Raises:
+        CudaError: On import, mapping, or benchmark failure.
+        RuntimeError: On lock acquisition failure.
     """
     peer_name = peer_host.split(".")[0]
     ensure_cuda_context(local_gpu_idx)
@@ -645,10 +743,14 @@ def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
 def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
                             remote_gpu_idx: int,
                             local_gpu_idx: int) -> tuple[str, str, float, float]:
-    """Request a chunk from a specific remote GPU, import it on a specific
-    local GPU, and verify contents.
+    """Run one benchmark: fetch remote chunk metadata, import, measure, verify.
 
-    Returns (result_str, peer_node_name, lock_wait_ms, benchmark_ms).
+    This is the top-level entry point for a single GPU-to-GPU measurement.
+    Handles all errors internally — never raises.
+
+    Returns:
+        (result_str, peer_node_name, lock_wait_ms, benchmark_ms).
+        On failure, result_str is an error tag and timing values are 0.0.
     """
     try:
         meta = fetch_chunk_meta(peer_host, port, remote_gpu_idx)
@@ -680,11 +782,15 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
 
 
 def discover_peers() -> list[tuple[str, str]]:
-    """Discover peer pods via DNS SRV lookup on the headless service.
+    """Discover peer pods via DNS SRV lookup on the headless Service.
 
-    Returns list of (pod_name, fqdn) for all peers except self.
-    Kubernetes CoreDNS serves SRV records for headless services with named
-    ports: _<port-name>._<proto>.<svc>.<namespace>.svc.cluster.local
+    Returns:
+        List of (pod_name, fqdn) for all peers except self.
+
+    Raises:
+        dns.resolver.NXDOMAIN: If the SRV record does not exist yet.
+        dns.resolver.NoAnswer: If the DNS server has no SRV records.
+        dns.resolver.LifetimeTimeout: If the DNS query times out.
     """
     srv_name = f"_http._tcp.{SVC_NAME}.{K8S_NAMESPACE}.svc.cluster.local"
     answers = dns.resolver.resolve(srv_name, "SRV", lifetime=5)
@@ -785,7 +891,7 @@ def peer_poll_loop():
 
 
 def _wait_until(deadline):
-    """Sleep until the given monotonic deadline, checking every 10ms."""
+    """Busy-wait until the given monotonic-clock deadline (10ms resolution)."""
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -805,7 +911,7 @@ def start_peer_poll_thread():
 class HTTPHandler(BaseHTTPRequestHandler):
 
     def _respond(self, code, body):
-        """Send a response with the given status code and body bytes."""
+        """Send an HTTP response. Accepts str or bytes body."""
         self.send_response(code)
         self.end_headers()
         if isinstance(body, str):
@@ -813,9 +919,11 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _parse_gpu_index(self):
-        """Parse and validate gpu_index from query string. Returns
-        (parsed_url, params, gpu_idx) or sends an error response and
-        returns None."""
+        """Parse gpu_index from the query string.
+
+        Returns (parsed_url, params, gpu_idx) on success, or sends a
+        400 error response and returns None.
+        """
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         gpu_index_vals = params.get("gpu_index")
@@ -870,7 +978,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self._respond(404, b"unknown path")
 
     def _handle_lock_gpu(self, gpu_idx):
-        """Block until GPU lock is available, then return a token."""
+        """Block until GPU lock is acquired, respond with a lock token."""
         log.debug("HTTPD lock-gpu %d: request from %s, waiting",
                   gpu_idx, self.client_address[0])
         t0 = time.monotonic()
@@ -889,7 +997,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self._respond(200, token)
 
     def _handle_unlock_gpu(self, gpu_idx, params):
-        """Release GPU lock if token matches. Idempotent — always returns 200."""
+        """Release GPU lock if token matches. Idempotent; always returns 200."""
         token_vals = params.get("token")
         token = token_vals[0] if token_vals else None
         current_token = GPU_LOCK_TOKENS.get(gpu_idx)
@@ -987,6 +1095,12 @@ def _cudaGetErrorEnum(error):
 
 
 def checkCudaErrors(result):
+    """Unwrap a CUDA driver API result tuple.
+
+    Raises CudaError if the status code indicates failure. On success,
+    returns the payload (single value or tuple of values), or None if
+    the result contains only the status code.
+    """
     if result[0].value:
         raise CudaError(
             "CUDA error code={}({})".format(
