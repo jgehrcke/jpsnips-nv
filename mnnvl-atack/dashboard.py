@@ -15,6 +15,7 @@ Uses rich for terminal rendering. Manages kubectl logs -f subprocesses
 per pod to collect bandwidth measurements. Press Ctrl-C to quit.
 """
 
+import concurrent.futures
 import datetime
 import fcntl
 import json
@@ -257,8 +258,23 @@ def get_cd_daemons():
         parts = name.split("-")
         tail = parts[-1] if parts else name
         display_name = f"…-{tail}"
+        created = item["metadata"].get("creationTimestamp", "")
+        age = ""
+        if created:
+            try:
+                ct = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+                delta = datetime.datetime.now(datetime.timezone.utc) - ct
+                secs = int(delta.total_seconds())
+                if secs < 60:
+                    age = f"{secs}s"
+                elif secs < 3600:
+                    age = f"{secs // 60}m{secs % 60}s"
+                else:
+                    age = f"{secs // 3600}h{(secs % 3600) // 60}m"
+            except Exception:
+                age = "?"
         daemons.append({"name": name, "display_name": display_name,
-                         "node": node, "status": status})
+                         "node": node, "status": status, "age": age})
     return sorted(daemons, key=lambda d: d["node"])
 
 
@@ -423,8 +439,6 @@ def build_pods_table(atack_pods):
     table.add_column("Direct Probe")
     table.add_column("Liveness")
     table.add_column("Last Result")
-    table.add_column("Fatal CUDA Error")
-
     for p in atack_pods:
         color = status_color(p["status"])
         probe = p.get("direct_probe", "")
@@ -434,9 +448,6 @@ def build_pods_table(atack_pods):
             probe_text = Text(probe, style="red")
         else:
             probe_text = Text("")
-        cuda_fatal = ""
-        if p.get("cuda_fatal"):
-            cuda_fatal = Text("ILLEGAL_STATE", style="red bold")
         last_result = p.get("last_result_ago")
         if last_result is not None:
             last_result_text = Text(f"{last_result}s ago")
@@ -453,10 +464,10 @@ def build_pods_table(atack_pods):
         table.add_row(p["idx"], p["name"], p["node"], p.get("age", ""),
                       Text(p["status"], style=color),
                       restarts_text, probe_text, liveness,
-                      last_result_text, cuda_fatal)
+                      last_result_text)
 
     if not atack_pods:
-        table.add_row("—", "no pods", "", "", "", "", "", "", "", "")
+        table.add_row("—", "no pods", "", "", "", "", "", "", "")
 
     return Panel(table, title="Workload Pods", title_align="left",
                  border_style="blue", padding=(0, 1))
@@ -467,6 +478,7 @@ def build_cd_table(cd_daemons):
                   pad_edge=False, show_edge=False, padding=(0, 1))
     table.add_column("Pod")
     table.add_column("Node")
+    table.add_column("Age")
     table.add_column("Status")
 
     for d in cd_daemons:
@@ -474,11 +486,12 @@ def build_cd_table(cd_daemons):
         table.add_row(
             d["display_name"],
             d["node"],
+            d.get("age", ""),
             Text(d["status"], style=color),
         )
 
     if not cd_daemons:
-        table.add_row("—", "none found", "")
+        table.add_row("—", "none found", "", "")
 
     return Panel(table, title="ComputeDomain Daemon Pods (IMEX Daemons)", title_align="left",
                  border_style="blue", padding=(0, 1))
@@ -735,9 +748,12 @@ def pods_poller(state, poll_s, linger_s):
             if now - gone[name]["vanished_at"] > linger_s:
                 del gone[name]
 
-        # Probe healthz for each Ready pod via node IP.
-        for p in fresh:
-            probe_pod_healthz(p)
+        # Probe healthz for all Ready pods in parallel via node IP.
+        ready_pods = [p for p in fresh if p["status"] == "Ready" and p.get("node_ip")]
+        if ready_pods:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(ready_pods)) as pool:
+                pool.map(probe_pod_healthz, ready_pods)
 
         merged = fresh + [g["data"] for g in gone.values()]
         prev_pods = merged
