@@ -13,6 +13,7 @@ Each pod:
   - Reports bandwidth results for consumption by the dashboard.
 """
 
+import atexit
 import base64
 import ctypes
 import json
@@ -89,6 +90,47 @@ VERIFY_LOCAL_BUFS = {}       # {gpu_idx: CUdeviceptr}
 VERIFY_LOCAL_BUF_SIZES = {}  # {gpu_idx: int}
 VERIFY_PARTIALS_BUFS = {}    # {gpu_idx: CUdeviceptr}
 
+# Shared chunk allocations tracked for cleanup on exit.
+# {gpu_idx: (va_ptr, alloc_size, alloc_handle)}
+SHARED_CHUNK_ALLOCS = {}
+
+
+def cuda_cleanup():
+    """Release all CUDA resources (shared chunks, verify buffers, contexts).
+
+    Registered via atexit so that graceful exits (SIGTERM, SIGINT, normal
+    return) clean up properly. SIGKILL cannot be caught — in that case the
+    CUDA driver handles cleanup at process teardown.
+    """
+    log.info("cuda_cleanup: releasing GPU resources")
+    for gpu_idx in list(SHARED_CHUNK_ALLOCS.keys()):
+        va_ptr, alloc_size, alloc_handle = SHARED_CHUNK_ALLOCS[gpu_idx]
+        try:
+            ensure_cuda_context(gpu_idx)
+            driver.cuMemUnmap(va_ptr, alloc_size)
+            driver.cuMemAddressFree(va_ptr, alloc_size)
+            driver.cuMemRelease(alloc_handle)
+            pop_cuda_context()
+        except Exception as exc:
+            log.warning("cuda_cleanup: GPU %d shared chunk: %s", gpu_idx, exc)
+
+    for gpu_idx in list(VERIFY_LOCAL_BUFS.keys()):
+        try:
+            ensure_cuda_context(gpu_idx)
+            driver.cuMemFree(VERIFY_LOCAL_BUFS[gpu_idx])
+            driver.cuMemFree(VERIFY_PARTIALS_BUFS[gpu_idx])
+            pop_cuda_context()
+        except Exception as exc:
+            log.warning("cuda_cleanup: GPU %d verify buffers: %s", gpu_idx, exc)
+
+    for gpu_idx in list(CUDEVS.keys()):
+        try:
+            driver.cuDevicePrimaryCtxRelease(CUDEVS[gpu_idx])
+        except Exception as exc:
+            log.warning("cuda_cleanup: GPU %d context release: %s", gpu_idx, exc)
+
+    log.info("cuda_cleanup: done")
+
 
 def main():
     log.info("pod name: %s", K8S_PODNAME)
@@ -109,6 +151,7 @@ def main():
 
     log_imex_state()
     cuda_init()
+    atexit.register(cuda_cleanup)
     log_device_properties()
     prepare_all_shared_chunks()
 
@@ -492,6 +535,9 @@ def _prepare_shared_chunk_for_gpu(gpu_idx):
     checkCudaErrors(driver.cuMemsetD32(va_ptr, float_as_uint32, num_floats))
     # cuMemsetD32 is asynchronous — wait for completion before exporting.
     checkCudaErrors(driver.cuCtxSynchronize())
+
+    # Track for cleanup on exit.
+    SHARED_CHUNK_ALLOCS[gpu_idx] = (va_ptr, alloc_size, alloc_handle)
 
     fabric_handle = checkCudaErrors(
         driver.cuMemExportToShareableHandle(
