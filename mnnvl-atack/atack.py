@@ -863,23 +863,33 @@ _TRANSIENT_CONN_ERRORS = (
 )
 
 
+def _is_dns_failure(exc):
+    """Check if a requests exception is a DNS resolution failure."""
+    msg = str(exc).lower()
+    return "name or service not known" in msg or "name resolution" in msg
+
+
 def _fetch_chunk_meta_with_retry(peer_host, port, gpu_index, peer_name):
     """Fetch chunk metadata with one explicit retry for transient connection
-    errors. Logs a concise message (no stack trace) for expected errors
-    like ConnectionRefused and NewConnectionError.
+    errors. No retry for DNS failures — raises PeerUnreachableError
+    immediately so the caller can skip the entire peer.
 
-    Raises on persistent failure.
+    Raises:
+        PeerUnreachableError: If the peer's DNS name doesn't resolve.
     """
     for attempt in range(2):
         try:
             return fetch_chunk_meta(peer_host, port, gpu_index)
         except _TRANSIENT_CONN_ERRORS as exc:
-            # Extract the innermost error message, skip the wrapper chain.
             msg = str(exc)
             if hasattr(exc, "args") and exc.args:
                 inner = exc.args[0]
                 if hasattr(inner, "reason"):
                     msg = str(inner.reason)
+            # DNS failure: skip entire peer, no retry.
+            if _is_dns_failure(exc):
+                log.warning("peer %s unreachable (DNS): %s", peer_name, msg)
+                raise PeerUnreachableError(msg) from exc
             if attempt == 0:
                 log.info("fetch chunk %s gpu %d: %s (retrying)", peer_name,
                          gpu_index, msg)
@@ -1134,6 +1144,8 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
     try:
         meta = _fetch_chunk_meta_with_retry(peer_host, port, remote_gpu_idx,
                                             peer_name)
+    except PeerUnreachableError:
+        raise  # Propagate so the poll round skips this entire peer.
     except Exception:
         return ("req-err", "?", 0.0, 0.0)
 
@@ -1224,8 +1236,11 @@ def _run_one_poll_round():
     results = {}
     max_lock_wait_ms = 0.0
     benchmark_durations = []
+    skip_peers = set()  # Pod names to skip (DNS unreachable).
 
     for pod_name, peer_host, remote_gpu_idx, local_gpu_idx in work_items:
+        if pod_name in skip_peers:
+            continue
         peer_idx = pod_name.rsplit("-", 1)[1]
         log.debug("benchmark %s-g%d -> local-g%d",
                   pod_name, remote_gpu_idx, local_gpu_idx)
@@ -1233,9 +1248,13 @@ def _run_one_poll_round():
             log.info("poll round: shutdown requested, finishing after %d/%d benchmarks",
                      len(results), len(work_items))
             break
-        status, peer_node, lock_wait, bench_ms = import_and_verify_chunk(
-            pod_name, peer_host, HTTPD_PORT,
-            remote_gpu_idx, local_gpu_idx)
+        try:
+            status, peer_node, lock_wait, bench_ms = import_and_verify_chunk(
+                pod_name, peer_host, HTTPD_PORT,
+                remote_gpu_idx, local_gpu_idx)
+        except PeerUnreachableError:
+            skip_peers.add(pod_name)
+            continue
         max_lock_wait_ms = max(max_lock_wait_ms, lock_wait)
         if bench_ms > 0:
             benchmark_durations.append(bench_ms)
@@ -1521,6 +1540,12 @@ class CudaError(AtackError):
 
 class LockError(AtackError):
     """Raised when GPU lock acquisition fails (timeout, connection error)."""
+    pass
+
+
+class PeerUnreachableError(AtackError):
+    """Raised when a peer pod cannot be reached (DNS failure, connection refused).
+    The caller should skip all remaining GPU pairs for this peer."""
     pass
 
 
