@@ -1678,6 +1678,13 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if "/readyz" in self.path:
+            # Readiness: just confirms the HTTP server is alive and can
+            # respond. No state checks — a pod with CUDA errors is still
+            # "ready" to receive requests (lock/unlock, evict, etc.).
+            self._respond(200, b"ok")
+            return
+
         if "/healthz" in self.path:
             if FATAL_CUDA_ERROR:
                 self._respond(500, f"fatal: {FATAL_CUDA_ERROR}")

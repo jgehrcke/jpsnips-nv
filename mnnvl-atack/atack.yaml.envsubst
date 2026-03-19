@@ -95,7 +95,7 @@ spec:
               fieldPath: spec.nodeName
         readinessProbe:
           httpGet:
-            path: /healthz
+            path: /readyz
             port: 1337
           periodSeconds: 1
         # Liveness probe: active only after startup probe succeeds.
@@ -105,9 +105,9 @@ spec:
           httpGet:
             path: /healthz
             port: 1337
-          periodSeconds: 1
+          periodSeconds: 3
           timeoutSeconds: 1
-          failureThreshold: 3
+          failureThreshold: 5
         resources:
           limits:
             nvidia.com/gpu: ${GPUS_PER_NODE}
