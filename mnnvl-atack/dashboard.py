@@ -325,13 +325,16 @@ def build_pods_table(atack_pods):
     table.add_column("Age")
     table.add_column("Status")
     table.add_column("Liveness")
-    table.add_column("CUDA Fatal")
+    table.add_column("Fatal CUDA Error")
 
     for p in atack_pods:
         color = status_color(p["status"])
-        liveness = ""
         if p.get("liveness_failing"):
             liveness = Text("FAILING", style="red bold")
+        elif p.get("status") == "Ready":
+            liveness = Text("ok", style="green")
+        else:
+            liveness = ""
         cuda_fatal = ""
         if p.get("cuda_fatal"):
             cuda_fatal = Text("ILLEGAL_STATE", style="red bold")
