@@ -59,6 +59,8 @@ import concurrent.futures
 import ctypes
 import datetime
 import json
+
+import orjson
 import random
 import logging
 import os
@@ -332,7 +334,15 @@ def main():
     _broadcast_evict_to_peers()
     # 4. The poll thread checks SHUTTING_DOWN and finishes its current
     #    benchmark before exiting (daemon thread, will die with process).
-    log.info("graceful shutdown complete")
+    log.info("graceful shutdown complete, proceeding to exit")
+
+    # Schedule a hard kill if atexit cleanup hangs (e.g., CUDA driver
+    # call blocks indefinitely). Give it 10s then force exit.
+    def _hard_exit_watchdog():
+        time.sleep(10)
+        log.error("atexit cleanup hung for 10s, forcing exit")
+        os._exit(1)
+    threading.Thread(target=_hard_exit_watchdog, daemon=True).start()
 
 
 def cuda_init():
@@ -1472,9 +1482,9 @@ def _run_one_poll_round():
     Raises:
         dns.resolver.NXDOMAIN: If peer DNS does not exist yet.
     """
+    global LAST_RESULT_TIME, FATAL_CUDA_ERROR
     round_t0 = time.monotonic()
     peers = discover_peers()
-    global LAST_RESULT_TIME
     if not peers:
         # No peers, but DNS worked — we're alive, just alone.
         LAST_RESULT_TIME = time.monotonic()
@@ -1536,7 +1546,6 @@ def _run_one_poll_round():
 
     # If the entire round completed without any CUDA errors, clear the
     # fatal flag. This restores liveness after a transient ILLEGAL_STATE.
-    global FATAL_CUDA_ERROR
     _error_tags = ("err", "ILLEGAL_STATE", "INVALID_HANDLE", "MISMATCH", "lock-err")
     has_errors = any(any(tag in v for tag in _error_tags) for v in results.values())
     if not has_errors and FATAL_CUDA_ERROR is not None:
@@ -1544,7 +1553,6 @@ def _run_one_poll_round():
                  "errors, clearing FATAL_CUDA_ERROR (was: %s)", FATAL_CUDA_ERROR)
         FATAL_CUDA_ERROR = None
 
-    global LAST_RESULT_TIME
     LAST_RESULT_TIME = time.monotonic()
 
     round_dur = time.monotonic() - round_t0
@@ -1555,6 +1563,7 @@ def _run_one_poll_round():
     RESULTS_RING.append({
         "timestamp": datetime.datetime.now(datetime.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "_monotonic": time.monotonic(),  # For server-side age computation.
         "round_time_s": round(round_dur, 2),
         "benchmarks": dict(sorted(results.items())),
         "total": len(results),
@@ -1647,15 +1656,20 @@ class HTTPHandler(BaseHTTPRequestHandler):
                     n = max(1, min(int(n_vals[0]), RESULTS_RING_MAX))
             except (ValueError, IndexError):
                 pass
-            tail = RESULTS_RING[-n:] if RESULTS_RING else []
-            body = json.dumps({
+            now_mono = time.monotonic()
+            tail = []
+            for entry in RESULTS_RING[-n:]:
+                e = {k: v for k, v in entry.items() if not k.startswith("_")}
+                e["age_s"] = round(now_mono - entry["_monotonic"], 1)
+                tail.append(e)
+            body = orjson.dumps({
                 "pod_name": K8S_PODNAME,
                 "node_name": K8S_NODENAME,
                 "gpus_per_node": GPUS_PER_NODE,
                 "results": tail,
                 "fatal_cuda_error": FATAL_CUDA_ERROR,
                 "shutting_down": SHUTTING_DOWN.is_set(),
-            }).encode()
+            })
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
