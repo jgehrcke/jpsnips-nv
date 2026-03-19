@@ -861,86 +861,74 @@ def discover_peers() -> list[tuple[str, str]]:
     return peers
 
 
-def peer_poll_loop():
-    """Periodically discover peers and verify memory sharing with each.
+def _run_one_poll_round():
+    """Run one round of all-to-all benchmarks against discovered peers.
 
-    For each peer, iterates all remote GPU × local GPU pairs sequentially
-    in a single thread, switching CUDA contexts as needed. GPU locks on both
-    source and destination ensure exclusive HBM access during each DtoD
-    transfer.
+    Discovers peers, builds all (peer, remote_gpu, local_gpu) work items
+    in randomized order (to spread lock contention), benchmarks each pair,
+    and logs round stats + results.
 
-    Uses deadline-based scheduling: the next poll starts at a fixed interval
-    from the *start* of the previous poll, not the end. This keeps the
-    effective poll frequency stable regardless of how long each iteration
-    takes.
+    Raises:
+        dns.resolver.NXDOMAIN: If peer DNS does not exist yet.
     """
-    # Give the cluster a moment to settle.
+    peers = discover_peers()
+    if not peers:
+        log.info("peer poll: no peers discovered yet")
+        return
+
+    # Randomize to spread lock contention — without this, all pods try
+    # to lock the same GPUs at the same time.
+    work_items = [
+        (pod_name, peer_host, rg, lg)
+        for pod_name, peer_host in peers
+        for rg in range(GPUS_PER_NODE)
+        for lg in range(GPUS_PER_NODE)
+    ]
+    random.shuffle(work_items)
+
+    results = {}
+    max_lock_wait_ms = 0.0
+    benchmark_durations = []
+
+    for pod_name, peer_host, remote_gpu_idx, local_gpu_idx in work_items:
+        peer_idx = pod_name.rsplit("-", 1)[1]
+        log.debug("benchmark %s-g%d -> local-g%d",
+                  pod_name, remote_gpu_idx, local_gpu_idx)
+        status, peer_node, lock_wait, bench_ms = import_and_verify_chunk(
+            pod_name, peer_host, HTTPD_PORT,
+            remote_gpu_idx, local_gpu_idx)
+        max_lock_wait_ms = max(max_lock_wait_ms, lock_wait)
+        if bench_ms > 0:
+            benchmark_durations.append(bench_ms)
+        key = f"{peer_idx}@{peer_node}-g{remote_gpu_idx}-g{local_gpu_idx}"
+        results[key] = status
+
+    if benchmark_durations:
+        bmin = min(benchmark_durations)
+        bmax = max(benchmark_durations)
+        bmean = sum(benchmark_durations) / len(benchmark_durations)
+        log.info("round stats: DtoD min=%.1f max=%.1f mean=%.1f ms, "
+                 "max_lock_wait=%.1f ms", bmin, bmax, bmean, max_lock_wait_ms)
+
+    my_idx = K8S_PODNAME.rsplit("-", 1)[1]
+    parts = [f"{k}:{v}" for k, v in sorted(results.items())]
+    log.info("result(%s@%s): %s", my_idx, K8S_NODENAME, " ".join(parts))
+
+
+def peer_poll_loop():
+    """Deadline-based poll loop: starts a new round every POLL_INTERVAL_S
+    seconds, measured from the start of the previous round."""
     time.sleep(POLL_INTERVAL_S)
     next_deadline = time.monotonic()
 
     while True:
         next_deadline += POLL_INTERVAL_S
-        round_t0 = time.monotonic()
-
         try:
-            peers = discover_peers()
-            if not peers:
-                log.info("peer poll: no peers discovered yet")
-                _wait_until(next_deadline)
-                continue
-
-            # results: { "peer_idx@peer_node-gR-gL": status }
-            results = {}
-            peer_node_for_idx = {}
-
-            # Build list of all (peer, remote_gpu, local_gpu) triples and
-            # randomize the order. This spreads lock contention across GPUs
-            # — without randomization all pods try to lock the same GPUs
-            # at the same time, creating a thundering herd.
-            work_items = [
-                (pod_name, peer_host, rg, lg)
-                for pod_name, peer_host in peers
-                for rg in range(GPUS_PER_NODE)
-                for lg in range(GPUS_PER_NODE)
-            ]
-            random.shuffle(work_items)
-
-            my_idx = K8S_PODNAME.rsplit("-", 1)[1]
-            max_lock_wait_ms = 0.0
-            benchmark_durations = []
-            for pod_name, peer_host, remote_gpu_idx, local_gpu_idx in work_items:
-                peer_idx = pod_name.rsplit("-", 1)[1]
-                log.debug("benchmark %s-g%d -> local-g%d",
-                          pod_name, remote_gpu_idx, local_gpu_idx)
-                status, peer_node, lock_wait, bench_ms = import_and_verify_chunk(
-                    pod_name, peer_host, HTTPD_PORT,
-                    remote_gpu_idx, local_gpu_idx)
-                max_lock_wait_ms = max(max_lock_wait_ms, lock_wait)
-                if bench_ms > 0:
-                    benchmark_durations.append(bench_ms)
-                peer_node_for_idx[peer_idx] = peer_node
-                key = f"{peer_idx}@{peer_node}-g{remote_gpu_idx}-g{local_gpu_idx}"
-                results[key] = status
-
-            round_dur = time.monotonic() - round_t0
-            if benchmark_durations:
-                bmin = min(benchmark_durations)
-                bmax = max(benchmark_durations)
-                bmean = sum(benchmark_durations) / len(benchmark_durations)
-                log.info("round stats: DtoD min=%.1f max=%.1f mean=%.1f ms, "
-                         "max_lock_wait=%.1f ms",
-                         bmin, bmax, bmean, max_lock_wait_ms)
-            parts = []
-            for key, status in sorted(results.items()):
-                parts.append(f"{key}:{status}")
-            log.info("result(%s@%s): round_time=%.1fs %s",
-                     my_idx, K8S_NODENAME, round_dur, " ".join(parts))
-
+            _run_one_poll_round()
         except dns.resolver.NXDOMAIN:
             log.info("peer poll: DNS name does not exist yet (expected at startup)")
         except Exception:
             log.exception("peer poll error:")
-
         remaining = next_deadline - time.monotonic()
         log.info("waiting %.1fs for next poll deadline", max(0, remaining))
         _wait_until(next_deadline)
