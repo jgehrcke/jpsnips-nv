@@ -24,6 +24,7 @@ import select
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 
@@ -61,17 +62,38 @@ PEER_SINGLE_RE = re.compile(r"(\d+)@([^:]+):(\S+(?:\s+GB/s)?)")
 # kubectl helpers
 # ---------------------------------------------------------------------------
 
-def kubectl_json(args):
-    """Run kubectl with -o json, return parsed JSON or None."""
-    try:
-        out = subprocess.check_output(
-            ["kubectl"] + args + ["-o", "json"],
-            stderr=subprocess.DEVNULL, timeout=5,
-        )
-        return json.loads(out)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
-            json.JSONDecodeError):
-        return None
+KUBECTL_TIMEOUT_S = 5
+
+
+def kubectl_json(args, retries=2):
+    """Run kubectl with -o json, return parsed JSON or None.
+
+    Retries on timeout or error. Logs warnings on failure so kubectl
+    hangs don't go unnoticed.
+    """
+    cmd_str = " ".join(["kubectl"] + args + ["-o", "json"])
+    for attempt in range(1, retries + 1):
+        try:
+            out = subprocess.check_output(
+                ["kubectl"] + args + ["-o", "json"],
+                stderr=subprocess.DEVNULL, timeout=KUBECTL_TIMEOUT_S,
+            )
+            return json.loads(out)
+        except subprocess.TimeoutExpired:
+            print(f"dashboard: kubectl timeout ({KUBECTL_TIMEOUT_S}s) "
+                  f"attempt {attempt}/{retries}: {cmd_str}",
+                  file=sys.stderr)
+        except subprocess.CalledProcessError as exc:
+            print(f"dashboard: kubectl error (rc={exc.returncode}) "
+                  f"attempt {attempt}/{retries}: {cmd_str}",
+                  file=sys.stderr)
+        except json.JSONDecodeError:
+            print(f"dashboard: kubectl returned invalid JSON "
+                  f"attempt {attempt}/{retries}: {cmd_str}",
+                  file=sys.stderr)
+        if attempt < retries:
+            time.sleep(0.5)
+    return None
 
 
 def get_atack_pods():
@@ -158,22 +180,26 @@ def get_cd_status():
 # ---------------------------------------------------------------------------
 
 def scale_statefulset(delta):
-    """Scale atack statefulset by delta (+1 or -1). Errors go to stderr."""
-    try:
-        out = subprocess.check_output(
-            ["kubectl", "get", "statefulset", "atack",
-             "-o", "jsonpath={.spec.replicas}"],
-            stderr=subprocess.PIPE, timeout=5,
-        )
-        current = int(out.decode().strip())
-        target = max(0, current + delta)
-        subprocess.check_output(
-            ["kubectl", "scale", "statefulset", "atack",
-             f"--replicas={target}"],
-            stderr=subprocess.PIPE, timeout=5,
-        )
-    except Exception as exc:
-        print(f"scale error: {exc}", file=sys.stderr)
+    """Scale atack statefulset by delta (+1 or -1). Runs in a background
+    thread to avoid blocking the render loop."""
+    def _do_scale():
+        try:
+            out = subprocess.check_output(
+                ["kubectl", "get", "statefulset", "atack",
+                 "-o", "jsonpath={.spec.replicas}"],
+                stderr=subprocess.PIPE, timeout=5,
+            )
+            current = int(out.decode().strip())
+            target = max(0, current + delta)
+            subprocess.check_output(
+                ["kubectl", "scale", "statefulset", "atack",
+                 f"--replicas={target}"],
+                stderr=subprocess.PIPE, timeout=5,
+            )
+        except Exception as exc:
+            print(f"scale error: {exc}", file=sys.stderr)
+
+    threading.Thread(target=_do_scale, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +453,127 @@ def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
 
 
 # ---------------------------------------------------------------------------
+# Per-panel data threads. Each panel has its own polling thread that does
+# kubectl I/O independently. The render loop reads their latest results
+# without blocking, so a slow API server never stalls the UI.
+# ---------------------------------------------------------------------------
+
+class PanelState:
+    """Thread-safe container for one panel's data. Writers replace fields
+    atomically (Python GIL). Readers see a consistent snapshot."""
+    def __init__(self, **defaults):
+        for k, v in defaults.items():
+            setattr(self, k, v)
+        self.last_update = None  # monotonic
+
+
+def _linger_loop(fetch_fn, state, field, poll_s, linger_s, name_key="name"):
+    """Generic poll-and-linger loop for a list of items.
+
+    Fetches fresh data via ``fetch_fn()``, tracks vanished items for
+    ``linger_s`` seconds with status='Terminated', writes the merged
+    list to ``state.<field>``.
+    """
+    prev_names = set()
+    gone = {}
+    prev_items = []
+
+    while True:
+        now = time.monotonic()
+        fresh = fetch_fn()
+        fresh_names = set(item[name_key] for item in fresh)
+
+        for name in prev_names - fresh_names:
+            if name not in gone:
+                for item in prev_items:
+                    if item[name_key] == name:
+                        item["status"] = "Terminated"
+                        gone[name] = {"data": item, "vanished_at": now}
+                        break
+        prev_names = fresh_names
+
+        for name in list(gone.keys()):
+            if now - gone[name]["vanished_at"] > linger_s:
+                del gone[name]
+
+        merged = fresh + [g["data"] for g in gone.values()]
+        prev_items = merged
+        setattr(state, field, merged)
+        state.last_update = time.monotonic()
+        time.sleep(poll_s)
+
+
+def pods_poller(state, poll_s, linger_s):
+    """Polls atack pods. Updates state.pods and state.live_pod_indices."""
+    prev_names = set()
+    gone = {}
+    prev_pods = []
+
+    while True:
+        now = time.monotonic()
+        fresh = get_atack_pods()
+        fresh_names = set(p["name"] for p in fresh)
+
+        for name in prev_names - fresh_names:
+            if name not in gone:
+                for p in prev_pods:
+                    if p["name"] == name:
+                        p["status"] = "Terminated"
+                        gone[name] = {"data": p, "vanished_at": now}
+                        break
+        prev_names = fresh_names
+
+        for name in list(gone.keys()):
+            if now - gone[name]["vanished_at"] > linger_s:
+                del gone[name]
+
+        merged = fresh + [g["data"] for g in gone.values()]
+        prev_pods = merged
+        state.pods = merged
+        state.live_pod_indices = set(
+            p["idx"] for p in fresh if p["status"] == "Ready"
+        )
+        state.last_update = time.monotonic()
+        time.sleep(poll_s)
+
+
+def cd_daemons_poller(state, poll_s, linger_s):
+    """Polls ComputeDomain daemon pods."""
+    _linger_loop(get_cd_daemons, state, "daemons", poll_s, linger_s)
+
+
+def cd_status_poller(state, poll_s, linger_s):
+    """Polls ComputeDomain status (node list)."""
+    prev_node_names = set()
+    gone = {}
+
+    while True:
+        now = time.monotonic()
+        cd_status = get_cd_status()
+        fresh_names = set(n["name"] for n in cd_status["nodes"])
+
+        for nname in prev_node_names - fresh_names:
+            if nname not in gone:
+                gone[nname] = {
+                    "data": {"index": "?", "name": nname, "status": "stale"},
+                    "vanished_at": now,
+                }
+        prev_node_names = fresh_names
+
+        for nname in list(gone.keys()):
+            if now - gone[nname]["vanished_at"] > linger_s:
+                del gone[nname]
+
+        if gone:
+            cd_status["nodes"] = cd_status["nodes"] + [
+                g["data"] for g in gone.values()]
+
+        state.status = cd_status
+        state.last_update = time.monotonic()
+        time.sleep(poll_s)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -434,44 +581,47 @@ def main():
     pod_nodes = {}
     current_round = {}
     round_start = None
-    latest_matrix = {}       # {pod_idx: {peer_idx: value_str}}
-    matrix_round_num = {}    # {pod_idx: round_number} — when each row was last updated
+    latest_matrix = {}
+    matrix_round_num = {}
     round_counter = 0
     matrix_timestamp = None
-    detected_poll_s = None      # Auto-detected poll interval from result cadence.
-    last_result_times = {}      # {pod_idx: last_result_monotonic}
-    result_count = {}           # {pod_idx: count} — skip first interval per pod
-    bootstrap_intervals = []    # Collect initial intervals, seed EMA from median
-
-    atack_pods = []
-    cd_daemons = []
-    cd_status = {"overall": "?", "nodes": []}
-    live_pod_indices = set()
-    live_matrix_keys = set()  # e.g. {"0-0", "0-1", "1-0", "1-1"}
+    detected_poll_s = None
+    last_result_times = {}
+    result_count = {}
+    bootstrap_intervals = []
+    live_matrix_keys = set()
     detected_gpus_per_node = 1
 
     followers = {}
     fd_to_pod = {}
     line_bufs = {}
+    last_follower_check = 0
 
-    # Keep recently vanished pods visible for a few seconds.
-    # {pod_key: {data, vanished_at}} where pod_key is (panel, name).
     LINGER_S = 15.0
-    gone_pods = {}      # For atack pods: {name: {data, vanished_at}}
-    gone_cd = {}        # For CD daemons: {name: {data, vanished_at}}
-    gone_cd_nodes = {}  # For CD status nodes: {node_name: {data, vanished_at}}
-    prev_atack_names = set()
-    prev_cd_names = set()
-    prev_cd_node_names = set()
 
-    last_pod_poll = 0
-    last_cd_poll = 0
+    # Each panel has its own state object and polling thread.
+    pods_state = PanelState(pods=[], live_pod_indices=set())
+    cd_daemon_state = PanelState(daemons=[])
+    cd_status_state = PanelState(status={"overall": "?", "nodes": []})
+
+    threading.Thread(
+        target=pods_poller,
+        args=(pods_state, POD_POLL_INTERVAL_S, LINGER_S),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=cd_daemons_poller,
+        args=(cd_daemon_state, CD_POLL_INTERVAL_S, LINGER_S),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=cd_status_poller,
+        args=(cd_status_state, CD_POLL_INTERVAL_S, LINGER_S),
+        daemon=True,
+    ).start()
 
     console = Console()
 
-    # Put stdin in cbreak mode for single-keypress reading without
-    # breaking terminal output (unlike raw mode which interferes with
-    # rich's rendering).
     old_term = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
     stdin_fd = sys.stdin.fileno()
@@ -487,7 +637,7 @@ def main():
                 # --- Handle keyboard input ---
                 try:
                     key = os.read(stdin_fd, 1)
-                    if key in (b"q", b"Q", b"\x03"):  # q, Q, Ctrl-C
+                    if key in (b"q", b"Q", b"\x03"):
                         break
                     elif key in (b"u", b"U"):
                         scale_statefulset(+1)
@@ -496,39 +646,17 @@ def main():
                 except (BlockingIOError, OSError):
                     pass
 
-                # --- Poll atack pods ---
-                if now - last_pod_poll > POD_POLL_INTERVAL_S:
-                    last_pod_poll = now
-                    fresh_pods = get_atack_pods()
-                    fresh_names = set(p["name"] for p in fresh_pods)
+                # --- Read shared state from panel threads (non-blocking) ---
+                atack_pods = pods_state.pods
+                live_pod_indices = pods_state.live_pod_indices
+                live_matrix_keys = set(
+                    f"{idx}-{g}" for idx in live_pod_indices
+                    for g in range(detected_gpus_per_node)
+                )
 
-                    # Track newly vanished pods.
-                    for name in prev_atack_names - fresh_names:
-                        if name in gone_pods:
-                            continue
-                        # Find the last known data for this pod.
-                        for p in atack_pods:
-                            if p["name"] == name:
-                                p["status"] = "Terminated"
-                                gone_pods[name] = {"data": p, "vanished_at": now}
-                                break
-                    prev_atack_names = fresh_names
-
-                    # Expire old lingering pods.
-                    for name in list(gone_pods.keys()):
-                        if now - gone_pods[name]["vanished_at"] > LINGER_S:
-                            del gone_pods[name]
-
-                    # Combine fresh + lingering.
-                    atack_pods = fresh_pods + [g["data"] for g in gone_pods.values()]
-                    live_pod_indices = set(
-                        p["idx"] for p in fresh_pods if p["status"] == "Ready"
-                    )
-                    live_matrix_keys = set(
-                        f"{idx}-{g}" for idx in live_pod_indices
-                        for g in range(detected_gpus_per_node)
-                    )
-
+                # --- Manage log followers ---
+                if now - last_follower_check > POD_POLL_INTERVAL_S:
+                    last_follower_check = now
                     current_names = set(p["name"] for p in atack_pods)
                     for pod_name in current_names - set(followers.keys()):
                         proc = start_log_follower(pod_name)
@@ -536,7 +664,6 @@ def main():
                         fd = proc.stdout.fileno()
                         fd_to_pod[fd] = pod_name
                         line_bufs[fd] = b""
-
                     for pod_name in list(followers.keys()):
                         proc = followers[pod_name]
                         if proc.poll() is not None:
@@ -544,53 +671,6 @@ def main():
                             fd_to_pod.pop(fd, None)
                             line_bufs.pop(fd, None)
                             del followers[pod_name]
-
-                # --- Poll CD daemons and status ---
-                if now - last_cd_poll > CD_POLL_INTERVAL_S:
-                    last_cd_poll = now
-                    fresh_cd = get_cd_daemons()
-                    fresh_cd_names = set(d["name"] for d in fresh_cd)
-
-                    for name in prev_cd_names - fresh_cd_names:
-                        if name in gone_cd:
-                            continue
-                        for d in cd_daemons:
-                            if d["name"] == name:
-                                d["status"] = "Terminated"
-                                gone_cd[name] = {"data": d, "vanished_at": now}
-                                break
-                    prev_cd_names = fresh_cd_names
-
-                    for name in list(gone_cd.keys()):
-                        if now - gone_cd[name]["vanished_at"] > LINGER_S:
-                            del gone_cd[name]
-
-                    cd_daemons = fresh_cd + [g["data"] for g in gone_cd.values()]
-
-                    cd_status = get_cd_status()
-                    fresh_cd_node_names = set(n["name"] for n in cd_status["nodes"])
-
-                    for nname in prev_cd_node_names - fresh_cd_node_names:
-                        if nname in gone_cd_nodes:
-                            continue
-                        # Find last known data for this node.
-                        for prev_nodes in [cd_status["nodes"]]:
-                            pass  # Already gone from fresh data.
-                        # Check previous cd_status stored nodes.
-                        gone_cd_nodes[nname] = {
-                            "data": {"index": "?", "name": nname, "status": "stale"},
-                            "vanished_at": now,
-                        }
-                    prev_cd_node_names = fresh_cd_node_names
-
-                    for nname in list(gone_cd_nodes.keys()):
-                        if now - gone_cd_nodes[nname]["vanished_at"] > LINGER_S:
-                            del gone_cd_nodes[nname]
-
-                    # Merge lingering nodes into cd_status.
-                    if gone_cd_nodes:
-                        stale_nodes = [g["data"] for g in gone_cd_nodes.values()]
-                        cd_status["nodes"] = cd_status["nodes"] + stale_nodes
 
                 # --- Read log data ---
                 stdout_fds = [p.stdout for p in followers.values()
@@ -729,7 +809,8 @@ def main():
 
                 # --- Render ---
                 live.update(build_layout(
-                    atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
+                    pods_state.pods, cd_daemon_state.daemons,
+                    cd_status_state.status, latest_matrix, pod_nodes,
                     live_matrix_keys, matrix_timestamp, matrix_round_num,
                     round_counter, detected_poll_s))
 
