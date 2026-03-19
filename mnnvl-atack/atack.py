@@ -154,7 +154,7 @@ FATAL_CUDA_ERROR = None  # Set to error string on fatal error
 # Timestamp of last successful result emission. The /healthz endpoint
 # returns 500 if no result was produced within 3× the poll interval,
 # indicating the pod is stuck (hung CUDA call, dead thread, etc.).
-LAST_RESULT_TIME = None  # Set to time.monotonic() after each successful round.
+LAST_RESULT_TIME = None       # Set after ANY round (even partial).
 
 # Graceful shutdown coordination. Set by SIGTERM/SIGINT handler.
 # Components check this to wind down cleanly.
@@ -1540,6 +1540,8 @@ def _run_one_poll_round():
 
     global LAST_RESULT_TIME
     LAST_RESULT_TIME = time.monotonic()
+
+
 
     round_dur = time.monotonic() - round_t0
     my_idx = K8S_PODNAME.rsplit("-", 1)[1]

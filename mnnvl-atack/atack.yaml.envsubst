@@ -97,13 +97,14 @@ spec:
           httpGet:
             path: /healthz
             port: 1337
-          initialDelaySeconds: 1
           periodSeconds: 1
+        # Liveness probe: active only after startup probe succeeds.
+        # /healthz returns 500 if no result produced for 3× poll interval
+        # or on CUDA_ERROR_ILLEGAL_STATE.
         livenessProbe:
           httpGet:
             path: /healthz
             port: 1337
-          initialDelaySeconds: 5
           periodSeconds: 1
           failureThreshold: 2
         resources:
