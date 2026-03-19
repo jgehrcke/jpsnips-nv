@@ -516,7 +516,8 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
                 val = peers.get(c, "?")
                 if val == "?":
                     cells.append(Text("?", style="yellow"))
-                elif "err" in val.lower() or "MISMATCH" in val:
+                elif any(s in val for s in ("err", "ERR", "MISMATCH",
+                         "INVALID_HANDLE", "ILLEGAL_STATE", "lock-err")):
                     cells.append(Text(val, style="red bold"))
                 else:
                     cells.append(Text(val, style="green"))

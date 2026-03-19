@@ -153,6 +153,13 @@ FATAL_CUDA_ERROR = None  # Set to error string on fatal error
 # {gpu_idx: (va_ptr, alloc_size, alloc_handle)}
 SHARED_CHUNK_ALLOCS = {}
 
+# Previous chunk allocations kept alive for one refresh cycle. A remote pod
+# may have imported the old fabric handle and could still be doing a DtoD
+# copy from it. Freeing immediately would cause CUDA_ERROR_INVALID_HANDLE.
+# The old allocation is freed at the *next* refresh, by which time any
+# in-flight transfer has long completed (DtoD takes ~5ms, refresh is 30s).
+PREV_CHUNK_ALLOCS = {}  # {gpu_idx: (va_ptr, alloc_size, alloc_handle)}
+
 # Track currently held remote GPU locks for best-effort release on exit.
 # Set of (peer_host, port, gpu_index, token).
 HELD_REMOTE_LOCKS = set()
@@ -181,16 +188,20 @@ def cuda_cleanup():
                         peer_host, gpu_index)
     HELD_REMOTE_LOCKS.clear()
 
-    for gpu_idx in list(SHARED_CHUNK_ALLOCS.keys()):
-        va_ptr, alloc_size, alloc_handle = SHARED_CHUNK_ALLOCS[gpu_idx]
-        try:
-            ensure_cuda_context(gpu_idx)
-            driver.cuMemUnmap(va_ptr, alloc_size)
-            driver.cuMemRelease(alloc_handle)
-            driver.cuMemAddressFree(va_ptr, alloc_size)
-            pop_cuda_context()
-        except Exception as exc:
-            log.warning("cuda_cleanup: GPU %d shared chunk: %s", gpu_idx, exc)
+    for allocs_dict in [SHARED_CHUNK_ALLOCS, PREV_CHUNK_ALLOCS]:
+        for gpu_idx in list(allocs_dict.keys()):
+            entry = allocs_dict[gpu_idx]
+            if entry is None:
+                continue
+            va_ptr, alloc_size, alloc_handle = entry
+            try:
+                ensure_cuda_context(gpu_idx)
+                driver.cuMemUnmap(va_ptr, alloc_size)
+                driver.cuMemRelease(alloc_handle)
+                driver.cuMemAddressFree(va_ptr, alloc_size)
+                pop_cuda_context()
+            except Exception as exc:
+                log.warning("cuda_cleanup: GPU %d shared chunk: %s", gpu_idx, exc)
 
     for gpu_idx in list(VERIFY_LOCAL_BUFS.keys()):
         try:
@@ -594,23 +605,14 @@ def prepare_all_shared_chunks():
         pop_cuda_context()
 
 
-def _free_shared_chunk_for_gpu(gpu_idx):
-    """Free the old shared chunk allocation for one GPU.
-
-    Precondition: the GPU's CUDA context must be pushed.
-    """
-    old = SHARED_CHUNK_ALLOCS.get(gpu_idx)
-    if old is None:
-        return
-    va_ptr, alloc_size, alloc_handle = old
-    # Order: unmap → release handle → free VA range.
-    driver.cuMemUnmap(va_ptr, alloc_size)
-    driver.cuMemRelease(alloc_handle)
-    driver.cuMemAddressFree(va_ptr, alloc_size)
-
 
 def _refresh_shared_chunk_for_gpu(gpu_idx):
     """Replace the shared chunk on one GPU with a fresh allocation.
+
+    The old allocation is not freed immediately — it's kept in
+    PREV_CHUNK_ALLOCS and freed on the *next* refresh cycle. This
+    prevents CUDA_ERROR_INVALID_HANDLE for remote pods that imported
+    the old fabric handle and may still be doing a DtoD copy from it.
 
     Acquires the GPU lock to prevent benchmarks from reading during the
     swap. The lock hold time is ~1-2 ms (allocate + fill + sync).
@@ -620,9 +622,21 @@ def _refresh_shared_chunk_for_gpu(gpu_idx):
     Raises:
         CudaError: On allocation or memset failure.
     """
+    # Free the allocation from the *previous* refresh cycle (two cycles old).
+    prev = PREV_CHUNK_ALLOCS.pop(gpu_idx, None)
+    if prev is not None:
+        va_ptr, alloc_size, alloc_handle = prev
+        try:
+            driver.cuMemUnmap(va_ptr, alloc_size)
+            driver.cuMemRelease(alloc_handle)
+            driver.cuMemAddressFree(va_ptr, alloc_size)
+        except Exception:
+            log.warning("failed to free previous chunk on GPU %d (ignored)", gpu_idx)
+
+    # Stash the current allocation, allocate a new one under the lock.
     acquire_local_gpu_lock(gpu_idx)
     try:
-        _free_shared_chunk_for_gpu(gpu_idx)
+        PREV_CHUNK_ALLOCS[gpu_idx] = SHARED_CHUNK_ALLOCS.get(gpu_idx)
         _prepare_shared_chunk_for_gpu(gpu_idx)
     finally:
         release_local_gpu_lock(gpu_idx)
@@ -1048,10 +1062,18 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
             peer_host, port, remote_gpu_idx, local_gpu_idx,
             handle_bytes, meta["alloc_size"], meta["num_floats"],
             meta["float_value"])
-    except CudaError:
+    except CudaError as exc:
         log.exception("CUDA error %s g%d→g%d:", peer_name, remote_gpu_idx,
                       local_gpu_idx)
-        return ("cuda-err", peer_node, 0.0, 0.0)
+        # Include specific CUDA error in result for dashboard display.
+        # e.g. "INVALID_HANDLE" from "CUDA error code=400(b'CUDA_ERROR_INVALID_HANDLE')"
+        tag = "cuda-err"
+        exc_str = str(exc)
+        if "INVALID_HANDLE" in exc_str:
+            tag = "INVALID_HANDLE"
+        elif "ILLEGAL_STATE" in exc_str:
+            tag = "ILLEGAL_STATE"
+        return (tag, peer_node, 0.0, 0.0)
     except LockError as exc:
         log.warning("%s g%d→g%d: %s", peer_name, remote_gpu_idx,
                     local_gpu_idx, exc)
@@ -1145,8 +1167,8 @@ def _run_one_poll_round():
     global FATAL_CUDA_ERROR
     has_errors = any("err" in v.lower() for v in results.values())
     if not has_errors and FATAL_CUDA_ERROR is not None:
-        log.info("round completed without errors, clearing FATAL_CUDA_ERROR "
-                 "(was: %s)", FATAL_CUDA_ERROR)
+        log.info("LIVENESS FLIP failing→healthy: round completed without "
+                 "errors, clearing FATAL_CUDA_ERROR (was: %s)", FATAL_CUDA_ERROR)
         FATAL_CUDA_ERROR = None
 
     round_dur = time.monotonic() - round_t0
@@ -1416,10 +1438,18 @@ def checkCudaErrors(result):
         # state corruption. Flag it so /healthz fails the liveness probe,
         # causing kubelet to replace this pod with a fresh one (new IMEX
         # daemon resource claims).
+        # Only CUDA_ERROR_ILLEGAL_STATE triggers the liveness probe —
+        # it indicates unrecoverable GPU state corruption. Other errors
+        # like INVALID_HANDLE may be transient (e.g. stale handle after
+        # chunk refresh) and surface via the result line / dashboard.
         if result[0] == driver.CUresult.CUDA_ERROR_ILLEGAL_STATE:
+            was_healthy = FATAL_CUDA_ERROR is None
             FATAL_CUDA_ERROR = error_msg
-            log.error("FATAL: %s — liveness probe will fail, pod will be replaced",
-                      error_msg)
+            if was_healthy:
+                log.error("LIVENESS FLIP healthy→failing: %s — "
+                          "/healthz will return 500", error_msg)
+            else:
+                log.error("LIVENESS still failing: %s", error_msg)
 
         raise CudaError(error_msg)
     if len(result) == 1:
