@@ -55,6 +55,7 @@ Three mechanisms keep the locking robust:
 
 import atexit
 import base64
+import collections
 import concurrent.futures
 import ctypes
 import datetime
@@ -159,9 +160,11 @@ FATAL_CUDA_ERROR = None  # Set to error string on fatal error
 # indicating the pod is stuck (hung CUDA call, dead thread, etc.).
 LAST_RESULT_TIME = None       # Set after ANY round (even partial).
 
-# Latest round result for the /results endpoint.
-LATEST_RESULT = None          # Set after each round completes.
-_LATEST_RESULT_MONO = None    # Monotonic time of LATEST_RESULT, for age_s.
+# Recent round results for the /results endpoint.
+# Deque of completed results, most recent last.
+# In-progress round is updated incrementally as each peer completes.
+RESULTS_HISTORY_MAX = 5
+RESULTS_HISTORY = collections.deque(maxlen=RESULTS_HISTORY_MAX)
 
 # Graceful shutdown coordination. Set by SIGTERM/SIGINT handler.
 # Components check this to wind down cleanly.
@@ -1503,8 +1506,10 @@ def _run_one_poll_round():
         log.info("peer poll: no peers discovered yet")
         return
 
-    # Prefetch chunk metadata for all peers. Skip unreachable peers.
+    # Prefetch chunk metadata for all peers. Track unreachable peers
+    # so we can emit explicit error entries for them in the results.
     peer_metas = {}
+    unreachable_peers = {}  # {pod_name: error_tag}
     for pod_name, peer_host in peers:
         try:
             peer_metas[pod_name] = _prefetch_peer_chunk_metas(
@@ -1512,10 +1517,12 @@ def _run_one_poll_round():
         except PeerUnreachableError:
             log.warning("lost peer %s — DNS resolution failed, skipping for this round",
                         pod_name)
+            unreachable_peers[pod_name] = "unreachable"
         except Exception:
             log.exception("failed to prefetch chunk metas from %s:", pod_name)
+            unreachable_peers[pod_name] = "prefetch-err"
 
-    if not peer_metas:
+    if not peer_metas and not unreachable_peers:
         return
 
     # Evict import cache entries for handles that changed or disappeared.
@@ -1530,6 +1537,26 @@ def _run_one_poll_round():
     results = []
     max_lock_wait_ms = 0.0
     benchmark_durations = []
+
+    _error_tags = ("err", "ILLEGAL_STATE", "INVALID_HANDLE", "LAUNCH_FAILED",
+                   "MISMATCH", "lock-err", "unreachable", "prefetch-err")
+
+    round_ts = (datetime.datetime.now(datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+    round_mono = time.monotonic()
+
+    # Emit error entries for unreachable peers.
+    for pod_name, error_tag in unreachable_peers.items():
+        peer_idx = pod_name.rsplit("-", 1)[1]
+        for rg in range(GPUS_PER_NODE):
+            for lg in range(GPUS_PER_NODE):
+                results.append({
+                    "peer_idx": peer_idx,
+                    "peer_node": "?",
+                    "remote_gpu": rg,
+                    "local_gpu": lg,
+                    "value": error_tag,
+                })
 
     reachable_peers = [(pn, ph) for pn, ph in peers if pn in peer_metas]
     with concurrent.futures.ThreadPoolExecutor(
@@ -1558,7 +1585,6 @@ def _run_one_poll_round():
 
     # If the entire round completed without any CUDA errors, clear the
     # fatal flag. This restores liveness after a transient ILLEGAL_STATE.
-    _error_tags = ("err", "ILLEGAL_STATE", "INVALID_HANDLE", "LAUNCH_FAILED", "MISMATCH", "lock-err")
     has_errors = any(any(tag in b["value"] for tag in _error_tags)
                      for b in results)
     if not has_errors and FATAL_CUDA_ERROR is not None:
@@ -1570,25 +1596,25 @@ def _run_one_poll_round():
 
     round_dur = time.monotonic() - round_t0
 
-    # Store latest result for /results endpoint.
-    # Add combined key to each entry for convenience.
+    # Finalize and move to history.
     for b in results:
-        b["key"] = (f"{b['peer_idx']}@{b['peer_node']}"
-                    f"-g{b['remote_gpu']}-g{b['local_gpu']}")
+        if "key" not in b:
+            b["key"] = (f"{b['peer_idx']}@{b['peer_node']}"
+                        f"-g{b['remote_gpu']}-g{b['local_gpu']}")
     ok_count = sum(1 for b in results
                    if not any(tag in b["value"] for tag in _error_tags))
     benchmarks_sorted = sorted(results, key=lambda b: b["key"])
-    global LATEST_RESULT, _LATEST_RESULT_MONO
-    LATEST_RESULT = {
-        "timestamp": datetime.datetime.now(datetime.timezone.utc)
-            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    final_result = {
+        "timestamp": round_ts,
+        "_monotonic": round_mono,
         "round_time_s": round(round_dur, 2),
         "benchmarks": benchmarks_sorted,
         "total": len(results),
         "ok": ok_count,
         "errors": len(results) - ok_count,
     }
-    _LATEST_RESULT_MONO = time.monotonic()
+    RESULTS_HISTORY.append(final_result)
+
     my_idx = K8S_PODNAME.rsplit("-", 1)[1]
     parts = [f"{b['key']}:{b['value']}" for b in benchmarks_sorted]
     log.info("result(%s@%s): round_time=%.1fs %s",
@@ -1664,16 +1690,19 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if "/results" in self.path:
-            result = None
-            if LATEST_RESULT is not None:
-                result = dict(LATEST_RESULT)
-                result["age_s"] = round(
-                    time.monotonic() - _LATEST_RESULT_MONO, 1)
+            now_mono = time.monotonic()
+            # Build results list: completed history + in-progress round.
+            results = []
+            for entry in list(RESULTS_HISTORY):
+                e = {k: v for k, v in entry.items()
+                     if not k.startswith("_")}
+                e["age_s"] = round(now_mono - entry["_monotonic"], 1)
+                results.append(e)
             body = orjson.dumps({
                 "pod_name": K8S_PODNAME,
                 "node_name": K8S_NODENAME,
                 "gpus_per_node": GPUS_PER_NODE,
-                "result": result,
+                "results": results,
                 "fatal_cuda_error": FATAL_CUDA_ERROR,
                 "shutting_down": SHUTTING_DOWN.is_set(),
             })

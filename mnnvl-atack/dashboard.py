@@ -591,7 +591,7 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
             col_pod = c.split("-", 1)[0]
             if col_pod == row_pod:
                 cells.append(Text("—", style="dim"))
-            elif not peers or is_stale:
+            elif not peers:
                 cells.append(Text("?", style="yellow"))
             else:
                 val = peers.get(c, "?")
@@ -599,8 +599,11 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
                     cells.append(Text("?", style="yellow"))
                 elif any(s in val for s in ("err", "ERR", "MISMATCH",
                          "INVALID_HANDLE", "ILLEGAL_STATE",
-                         "LAUNCH_FAILED", "lock-err")):
+                         "LAUNCH_FAILED", "lock-err",
+                         "unreachable")):
                     cells.append(Text(val, style="red bold"))
+                elif is_stale:
+                    cells.append(Text(val, style="dim"))
                 else:
                     cells.append(Text(val, style="green"))
         table.add_row(*cells)
@@ -798,33 +801,39 @@ def _pod_results_loop(state, idx, node_ip, uid, poll_s, stop_event):
         if fetch_count <= 3 or fetch_count % 50 == 0:
             dlog.warning("pod %s fetch #%d: data=%s", idx, fetch_count,
                          "yes" if data else "no")
-        result = data.get("result") if data else None
-        if result:
-            age_s = result.get("age_s", 999)
-            timestamp = result.get("timestamp", "")
+        results_list = data.get("results", []) if data else []
+        if results_list:
+            # Most recent entry (may be in-progress).
+            latest = results_list[-1]
+            age_s = latest.get("age_s", 999)
+            latest_ts = latest.get("timestamp", "")
 
             # Always update age (freshness indicator).
             state.last_result_times[idx] = (age_s, uid)
 
-            # Only update the matrix when the result actually changed.
-            if timestamp and timestamp != prev_timestamp:
-                benchmarks = result.get("benchmarks", [])
-                for b in benchmarks:
-                    peer_idx = str(b["peer_idx"])
-                    peer_node = b["peer_node"]
-                    remote_gpu = str(b["remote_gpu"])
-                    local_gpu = str(b["local_gpu"])
-                    val = b["value"]
-                    if val.endswith(" GB/s"):
-                        val = val[:-5]
-                    row_key = f"{idx}-{local_gpu}"
-                    col_key = f"{peer_idx}-{remote_gpu}"
-                    if row_key not in state.matrix:
-                        state.matrix[row_key] = {}
-                    state.matrix[row_key][col_key] = val
-                    state.cell_times[row_key] = now
-                    state.pod_nodes[idx] = data.get("node_name", "?")
-                    state.pod_nodes[peer_idx] = peer_node
+            # Only update the matrix when the latest timestamp changed.
+            if latest_ts and latest_ts != prev_timestamp:
+                # Merge all results: iterate oldest to newest so the
+                # most recent value for each cell wins. This way, if the
+                # latest round is missing a cell (peer unreachable), the
+                # error or value from a previous round shows through.
+                for result in results_list:
+                    for b in result.get("benchmarks", []):
+                        peer_idx = str(b["peer_idx"])
+                        peer_node = b["peer_node"]
+                        remote_gpu = str(b["remote_gpu"])
+                        local_gpu = str(b["local_gpu"])
+                        val = b["value"]
+                        if val.endswith(" GB/s"):
+                            val = val[:-5]
+                        row_key = f"{idx}-{local_gpu}"
+                        col_key = f"{peer_idx}-{remote_gpu}"
+                        if row_key not in state.matrix:
+                            state.matrix[row_key] = {}
+                        state.matrix[row_key][col_key] = val
+                        state.cell_times[row_key] = now
+                        state.pod_nodes[idx] = data.get("node_name", "?")
+                        state.pod_nodes[peer_idx] = peer_node
 
                 state.timestamp = datetime.datetime.now()
                 state.last_update = now
@@ -839,7 +848,7 @@ def _pod_results_loop(state, idx, node_ip, uid, poll_s, stop_event):
                         else:
                             state.detected_poll_s = (
                                 0.8 * state.detected_poll_s + 0.2 * interval)
-                prev_timestamp = timestamp
+                prev_timestamp = latest_ts
                 prev_timestamp_mono = now
 
         stop_event.wait(poll_s)
