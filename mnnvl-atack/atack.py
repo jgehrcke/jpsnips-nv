@@ -143,6 +143,10 @@ FATAL_CUDA_ERROR = None  # Set to error string on fatal error
 # {gpu_idx: (va_ptr, alloc_size, alloc_handle)}
 SHARED_CHUNK_ALLOCS = {}
 
+# Track currently held remote GPU locks for best-effort release on exit.
+# Set of (peer_host, port, gpu_index, token).
+HELD_REMOTE_LOCKS = set()
+
 
 def cuda_cleanup():
     """Release all CUDA resources (shared chunks, verify buffers, contexts).
@@ -152,6 +156,21 @@ def cuda_cleanup():
     CUDA driver handles cleanup at process teardown.
     """
     log.info("cuda_cleanup: releasing GPU resources")
+
+    # Best-effort release of any remote GPU locks we still hold.
+    # Use very short timeouts — we're in teardown and may be killed soon.
+    for peer_host, port, gpu_index, token in list(HELD_REMOTE_LOCKS):
+        try:
+            url = (f"http://{peer_host}:{port}/unlock-gpu"
+                   f"?gpu_index={gpu_index}&token={token}")
+            requests.post(url, timeout=(0.3, 0.5))
+            log.info("cuda_cleanup: released remote lock %s gpu %d",
+                     peer_host, gpu_index)
+        except Exception:
+            log.warning("cuda_cleanup: failed to release remote lock %s gpu %d",
+                        peer_host, gpu_index)
+    HELD_REMOTE_LOCKS.clear()
+
     for gpu_idx in list(SHARED_CHUNK_ALLOCS.keys()):
         va_ptr, alloc_size, alloc_handle = SHARED_CHUNK_ALLOCS[gpu_idx]
         try:
@@ -488,9 +507,11 @@ def acquire_remote_gpu_lock(peer_host: str, port: int, gpu_index: int) -> tuple[
     if resp.status_code != 200:
         raise RuntimeError(f"lock-gpu failed: HTTP {resp.status_code}: {resp.text}")
     wait_ms = (time.monotonic() - t0) * 1000
+    token = resp.text
     log.debug("remote lock %s GPU %d: acquired in %.1f ms",
               peer_host, gpu_index, wait_ms)
-    return (resp.text, wait_ms)
+    HELD_REMOTE_LOCKS.add((peer_host, port, gpu_index, token))
+    return (token, wait_ms)
 
 
 def release_remote_gpu_lock(peer_host: str, port: int, gpu_index: int,
@@ -503,6 +524,7 @@ def release_remote_gpu_lock(peer_host: str, port: int, gpu_index: int,
 
     Never raises — failures are logged as warnings.
     """
+    HELD_REMOTE_LOCKS.discard((peer_host, port, gpu_index, token))
     url = f"http://{peer_host}:{port}/unlock-gpu?gpu_index={gpu_index}&token={token}"
     for attempt in range(7):
         try:
