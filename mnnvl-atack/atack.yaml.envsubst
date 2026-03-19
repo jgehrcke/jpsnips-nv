@@ -92,7 +92,7 @@ spec:
             path: /healthz
             port: 1337
           initialDelaySeconds: 5
-          periodSeconds: 3
+          periodSeconds: 1
           failureThreshold: 3
         resources:
           limits:

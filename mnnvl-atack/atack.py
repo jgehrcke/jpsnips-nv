@@ -960,9 +960,7 @@ def start_peer_poll_thread():
     t.start()
 
 
-# ---------------------------------------------------------------------------
-# HTTP server
-# ---------------------------------------------------------------------------
+
 
 class HTTPHandler(BaseHTTPRequestHandler):
 
@@ -1088,9 +1086,7 @@ def run_httpd_in_thread():
     t.start()
 
 
-# ---------------------------------------------------------------------------
-# IMEX / device inspection
-# ---------------------------------------------------------------------------
+
 
 def log_imex_state():
     try:
@@ -1134,9 +1130,7 @@ def log_device_properties():
         pop_cuda_context()
 
 
-# ---------------------------------------------------------------------------
-# CUDA error handling
-# ---------------------------------------------------------------------------
+
 
 class CudaError(RuntimeError):
     """Raised by checkCudaErrors() for CUDA API failures."""
