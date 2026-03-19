@@ -119,6 +119,7 @@ CHECKSUM_NUM_BLOCKS = {} # {gpu_idx: int}
 SHARED_CHUNK_ALLOC_HANDLES = {}  # {gpu_idx: CUmemGenericAllocationHandle}
 SHARED_CHUNK_STATIC_META = {}    # {gpu_idx: dict (without handle field)}
 LAST_EXPORTED_HANDLE_BYTES = {}  # {gpu_idx: bytes} — for detecting identical re-exports
+LAST_CHUNK_SERVED_TIME = {}     # {gpu_idx: monotonic} — when /prepare-chunk last served this GPU
 
 # Pre-allocated GPU buffers for verify_chunk_on_gpu(), per GPU.
 # Eliminates per-round cuMemAlloc/cuMemFree churn which may contribute to
@@ -671,7 +672,13 @@ def _refresh_shared_chunk_for_gpu(gpu_idx):
         if old is not None:
             RETIRED_CHUNKS.append(
                 (gpu_idx, old[0], old[1], old[2], time.monotonic()))
-            log.info("GPU %d: retired old chunk", gpu_idx)
+            last_served = LAST_CHUNK_SERVED_TIME.get(gpu_idx)
+            if last_served is not None:
+                ago = time.monotonic() - last_served
+                log.info("GPU %d: retired old chunk (last served %.1fs ago)",
+                         gpu_idx, ago)
+            else:
+                log.info("GPU %d: retired old chunk (never served)", gpu_idx)
         _prepare_shared_chunk_for_gpu(gpu_idx)
     finally:
         release_local_gpu_lock(gpu_idx)
@@ -1307,6 +1314,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self._respond(500, str(exc))
             return
         pop_cuda_context()
+        LAST_CHUNK_SERVED_TIME[gpu_idx] = time.monotonic()
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
