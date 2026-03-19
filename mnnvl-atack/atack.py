@@ -761,10 +761,17 @@ def chunk_refresh_loop():
             ensure_cuda_context(gpu_idx)
             try:
                 _refresh_shared_chunk_for_gpu(gpu_idx)
-                elapsed_ms = (time.monotonic() - t0) * 1000
-                log.info("refreshed shared chunk on GPU %d in %.1f ms", gpu_idx, elapsed_ms)
+                elapsed_s = time.monotonic() - t0
+                if elapsed_s > 1:
+                    log.warning("refreshed shared chunk on GPU %d in %.1fs (slow!)",
+                                gpu_idx, elapsed_s)
+                else:
+                    log.info("refreshed shared chunk on GPU %d in %.0f ms",
+                             gpu_idx, elapsed_s * 1000)
             except Exception:
-                log.exception("failed to refresh shared chunk on GPU %d:", gpu_idx)
+                elapsed_s = time.monotonic() - t0
+                log.exception("failed to refresh shared chunk on GPU %d "
+                              "(after %.1fs):", gpu_idx, elapsed_s)
             finally:
                 pop_cuda_context()
 
@@ -783,9 +790,16 @@ def _prepare_shared_chunk_for_gpu(gpu_idx):
     alloc_size = ((chunk_bytes + granularity - 1) // granularity) * granularity
     num_floats = alloc_size // 4
 
+    log.info("GPU %d: cuMemCreate(%d MiB) starting", gpu_idx,
+             alloc_size // (1024 * 1024))
+    t0 = time.monotonic()
     alloc_handle = checkCudaErrors(
         driver.cuMemCreate(alloc_size, ALLOC_PROPS[gpu_idx], 0))
+    create_ms = (time.monotonic() - t0) * 1000
+    if create_ms > 100:
+        log.warning("GPU %d: cuMemCreate took %.1fs", gpu_idx, create_ms / 1000)
 
+    t0 = time.monotonic()
     va_ptr = checkCudaErrors(
         driver.cuMemAddressReserve(alloc_size, granularity, 0, 0))
     checkCudaErrors(driver.cuMemMap(va_ptr, alloc_size, 0, alloc_handle, 0))
@@ -794,14 +808,21 @@ def _prepare_shared_chunk_for_gpu(gpu_idx):
     access_desc.location = ALLOC_PROPS[gpu_idx].location
     access_desc.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
     checkCudaErrors(driver.cuMemSetAccess(va_ptr, alloc_size, [access_desc], 1))
+    map_ms = (time.monotonic() - t0) * 1000
+    if map_ms > 100:
+        log.warning("GPU %d: reserve+map+access took %.1fs", gpu_idx, map_ms / 1000)
 
     # Fill GPU memory with FLOAT_VALUE directly on the GPU using cuMemsetD32.
     # cuMemsetD32 interprets the pattern as a uint32, so we reinterpret our
     # float32's bit pattern via struct pack/unpack.
+    t0 = time.monotonic()
     float_as_uint32 = struct.unpack("I", struct.pack("f", FLOAT_VALUE))[0]
     checkCudaErrors(driver.cuMemsetD32(va_ptr, float_as_uint32, num_floats))
     # cuMemsetD32 is asynchronous — wait for completion.
     checkCudaErrors(driver.cuCtxSynchronize())
+    fill_ms = (time.monotonic() - t0) * 1000
+    if fill_ms > 100:
+        log.warning("GPU %d: memset+sync took %.1fs", gpu_idx, fill_ms / 1000)
 
     # Track for cleanup on exit.
     SHARED_CHUNK_ALLOCS[gpu_idx] = (va_ptr, alloc_size, alloc_handle)
