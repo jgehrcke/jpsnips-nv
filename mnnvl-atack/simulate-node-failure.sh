@@ -104,12 +104,11 @@ while true; do
                 eval "$(echo "$RESULT_JSON" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
-r = d.get('results', [])
+r = d.get('result')
 if not r:
     print('TOTAL=0; ERRORS=-1; AGE=0; NO_RESULTS=yes')
 else:
-    last = r[-1]
-    print(f'TOTAL={last[\"total\"]}; ERRORS={last[\"errors\"]}; AGE={last[\"age_s\"]}; NO_RESULTS=no')
+    print(f'TOTAL={r[\"total\"]}; ERRORS={r[\"errors\"]}; AGE={r[\"age_s\"]}; NO_RESULTS=no')
 " 2>/dev/null || echo "TOTAL=0; ERRORS=-1; AGE=0; NO_RESULTS=yes")"
                 if [[ "$NO_RESULTS" == "yes" ]]; then
                     RESULT_STATUS="no results yet"

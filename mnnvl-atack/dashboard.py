@@ -788,6 +788,8 @@ def _fetch_pod_results(node_ip):
 def _pod_results_loop(state, idx, node_ip, uid, poll_s, stop_event):
     """Dedicated polling loop for one pod. Exits when stop_event is set."""
     fetch_count = 0
+    prev_timestamp = None       # Result timestamp from previous fetch.
+    prev_timestamp_mono = None  # Monotonic time when that timestamp first appeared.
     while not stop_event.is_set():
         now = time.monotonic()
         data = _fetch_pod_results(node_ip)
@@ -795,10 +797,11 @@ def _pod_results_loop(state, idx, node_ip, uid, poll_s, stop_event):
         if fetch_count <= 3 or fetch_count % 50 == 0:
             dlog.warning("pod %s fetch #%d: data=%s", idx, fetch_count,
                          "yes" if data else "no")
-        if data and data.get("results"):
-            latest = data["results"][-1]
-            age_s = latest.get("age_s", 999)
-            benchmarks = latest.get("benchmarks", [])
+        result = data.get("result") if data else None
+        if result:
+            age_s = result.get("age_s", 999)
+            benchmarks = result.get("benchmarks", [])
+            timestamp = result.get("timestamp", "")
 
             for b in benchmarks:
                 peer_idx = str(b["peer_idx"])
@@ -821,12 +824,19 @@ def _pod_results_loop(state, idx, node_ip, uid, poll_s, stop_event):
             state.timestamp = datetime.datetime.now()
             state.last_update = now
 
-            if age_s < 60:
-                if state.detected_poll_s is None:
-                    state.detected_poll_s = age_s
-                else:
-                    state.detected_poll_s = (
-                        0.8 * state.detected_poll_s + 0.2 * age_s)
+            # Detect benchmark repetition interval: track when results
+            # change for this pod by comparing timestamps.
+            if timestamp and timestamp != prev_timestamp:
+                if prev_timestamp_mono is not None:
+                    interval = now - prev_timestamp_mono
+                    if 0.5 < interval < 120:
+                        if state.detected_poll_s is None:
+                            state.detected_poll_s = interval
+                        else:
+                            state.detected_poll_s = (
+                                0.8 * state.detected_poll_s + 0.2 * interval)
+                prev_timestamp = timestamp
+                prev_timestamp_mono = now
 
         stop_event.wait(poll_s)
     dlog.warning("results poller for pod %s (uid=%s) exiting", idx, uid)

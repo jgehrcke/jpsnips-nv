@@ -159,10 +159,11 @@ FATAL_CUDA_ERROR = None  # Set to error string on fatal error
 # indicating the pod is stuck (hung CUDA call, dead thread, etc.).
 LAST_RESULT_TIME = None       # Set after ANY round (even partial).
 
-# Ring buffer of recent round results for the /results endpoint.
-# Each entry: {timestamp, round_time_s, benchmarks, total, ok, errors}
-RESULTS_RING = []             # Appended after each round.
-RESULTS_RING_MAX = 20         # Keep last 20 rounds.
+# Latest round result for the /results endpoint.
+LATEST_RESULT = None          # Set after each round completes.
+_LATEST_RESULT_MONO = None    # Monotonic time of LATEST_RESULT, for age_s.
+_results_generation = 0       # Bumped on each update; used for cache invalidation.
+_results_cache = None         # (generation, bytes) — cached JSON response.
 
 # Graceful shutdown coordination. Set by SIGTERM/SIGINT handler.
 # Components check this to wind down cleanly.
@@ -1565,7 +1566,7 @@ def _run_one_poll_round():
 
     round_dur = time.monotonic() - round_t0
 
-    # Append to ring buffer for /results endpoint.
+    # Store latest result for /results endpoint.
     # Add combined key to each entry for convenience.
     for b in results:
         b["key"] = (f"{b['peer_idx']}@{b['peer_node']}"
@@ -1573,18 +1574,18 @@ def _run_one_poll_round():
     ok_count = sum(1 for b in results
                    if not any(tag in b["value"] for tag in _error_tags))
     benchmarks_sorted = sorted(results, key=lambda b: b["key"])
-    RESULTS_RING.append({
+    global LATEST_RESULT, _LATEST_RESULT_MONO, _results_generation
+    LATEST_RESULT = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-        "_monotonic": time.monotonic(),  # For server-side age computation.
         "round_time_s": round(round_dur, 2),
         "benchmarks": benchmarks_sorted,
         "total": len(results),
         "ok": ok_count,
         "errors": len(results) - ok_count,
-    })
-    if len(RESULTS_RING) > RESULTS_RING_MAX:
-        RESULTS_RING[:] = RESULTS_RING[-RESULTS_RING_MAX:]
+    }
+    _LATEST_RESULT_MONO = time.monotonic()
+    _results_generation += 1
     my_idx = K8S_PODNAME.rsplit("-", 1)[1]
     parts = [f"{b['key']}:{b['value']}" for b in benchmarks_sorted]
     log.info("result(%s@%s): round_time=%.1fs %s",
@@ -1660,29 +1661,25 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if "/results" in self.path:
-            parsed = urlparse(self.path)
-            params = parse_qs(parsed.query)
-            n = 1
-            try:
-                n_vals = params.get("n")
-                if n_vals:
-                    n = max(1, min(int(n_vals[0]), RESULTS_RING_MAX))
-            except (ValueError, IndexError):
-                pass
-            now_mono = time.monotonic()
-            tail = []
-            for entry in RESULTS_RING[-n:]:
-                e = {k: v for k, v in entry.items() if not k.startswith("_")}
-                e["age_s"] = round(now_mono - entry["_monotonic"], 1)
-                tail.append(e)
-            body = orjson.dumps({
-                "pod_name": K8S_PODNAME,
-                "node_name": K8S_NODENAME,
-                "gpus_per_node": GPUS_PER_NODE,
-                "results": tail,
-                "fatal_cuda_error": FATAL_CUDA_ERROR,
-                "shutting_down": SHUTTING_DOWN.is_set(),
-            })
+            global _results_cache
+            gen = _results_generation
+            if _results_cache and _results_cache[0] == gen:
+                body = _results_cache[1]
+            else:
+                result = None
+                if LATEST_RESULT is not None:
+                    result = dict(LATEST_RESULT)
+                    result["age_s"] = round(
+                        time.monotonic() - _LATEST_RESULT_MONO, 1)
+                body = orjson.dumps({
+                    "pod_name": K8S_PODNAME,
+                    "node_name": K8S_NODENAME,
+                    "gpus_per_node": GPUS_PER_NODE,
+                    "result": result,
+                    "fatal_cuda_error": FATAL_CUDA_ERROR,
+                    "shutting_down": SHUTTING_DOWN.is_set(),
+                })
+                _results_cache = (gen, body)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
