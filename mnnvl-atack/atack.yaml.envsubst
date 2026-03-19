@@ -106,6 +106,7 @@ spec:
             path: /healthz
             port: 1337
           periodSeconds: 1
+          timeoutSeconds: 1
           failureThreshold: 2
         resources:
           limits:
