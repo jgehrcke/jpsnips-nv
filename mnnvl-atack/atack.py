@@ -1656,7 +1656,11 @@ class HTTPHandler(BaseHTTPRequestHandler):
             pod_name = pod_name_vals[0]
             log.info("HTTPD: evict-peer request for %s from %s",
                      pod_name, self.client_address[0])
+            t0 = time.monotonic()
             evict_peer_imports(pod_name)
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            log.info("HTTPD: evict-peer for %s completed in %.1f ms",
+                     pod_name, elapsed_ms)
             self._respond(200, b"evicted")
             return
 
