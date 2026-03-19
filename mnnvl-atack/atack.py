@@ -1379,6 +1379,8 @@ def _run_single_benchmark(peer_name: str, peer_host: str, port: int,
             tag = "INVALID_HANDLE"
         elif "ILLEGAL_STATE" in exc_str:
             tag = "ILLEGAL_STATE"
+        elif "LAUNCH_FAILED" in exc_str:
+            tag = "LAUNCH_FAILED"
         return (tag, peer_node, 0.0, 0.0)
     except LockError as exc:
         log.warning("%s g%d→g%d: %s", peer_name, remote_gpu_idx,
@@ -1546,7 +1548,7 @@ def _run_one_poll_round():
 
     # If the entire round completed without any CUDA errors, clear the
     # fatal flag. This restores liveness after a transient ILLEGAL_STATE.
-    _error_tags = ("err", "ILLEGAL_STATE", "INVALID_HANDLE", "MISMATCH", "lock-err")
+    _error_tags = ("err", "ILLEGAL_STATE", "INVALID_HANDLE", "LAUNCH_FAILED", "MISMATCH", "lock-err")
     has_errors = any(any(tag in v for tag in _error_tags) for v in results.values())
     if not has_errors and FATAL_CUDA_ERROR is not None:
         log.info("LIVENESS FLIP failing→healthy: round completed without "
@@ -1927,11 +1929,16 @@ def checkCudaErrors(result):
         # state corruption. Flag it so /healthz fails the liveness probe,
         # causing kubelet to replace this pod with a fresh one (new IMEX
         # daemon resource claims).
-        # Only CUDA_ERROR_ILLEGAL_STATE triggers the liveness probe —
-        # it indicates unrecoverable GPU state corruption. Other errors
-        # like INVALID_HANDLE may be transient (e.g. stale handle after
-        # chunk refresh) and surface via the result line / dashboard.
-        if result[0] == driver.CUresult.CUDA_ERROR_ILLEGAL_STATE:
+        # Fatal CUDA errors that indicate unrecoverable GPU/context
+        # corruption. These trigger the liveness probe to fail.
+        # - ILLEGAL_STATE: IMEX/driver state corruption.
+        # - LAUNCH_FAILED: a previous async operation failed, context
+        #   is likely corrupted — next call will be ILLEGAL_STATE.
+        _FATAL_CUDA_CODES = (
+            driver.CUresult.CUDA_ERROR_ILLEGAL_STATE,
+            driver.CUresult.CUDA_ERROR_LAUNCH_FAILED,
+        )
+        if result[0] in _FATAL_CUDA_CODES:
             was_healthy = FATAL_CUDA_ERROR is None
             FATAL_CUDA_ERROR = error_msg
             if was_healthy:
