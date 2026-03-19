@@ -1129,26 +1129,17 @@ def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
     return result, lock_wait_ms, benchmark_ms
 
 
-def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
-                            remote_gpu_idx: int,
-                            local_gpu_idx: int) -> tuple[str, str, float, float]:
-    """Run one benchmark: fetch remote chunk metadata, import, measure, verify.
+def _run_single_benchmark(peer_name: str, peer_host: str, port: int,
+                          remote_gpu_idx: int, local_gpu_idx: int,
+                          meta: dict) -> tuple[str, str, float, float]:
+    """Run one benchmark using pre-fetched chunk metadata.
 
-    This is the top-level entry point for a single GPU-to-GPU measurement.
     Handles all errors internally — never raises.
 
     Returns:
         (result_str, peer_node_name, lock_wait_ms, benchmark_ms).
         On failure, result_str is an error tag and timing values are 0.0.
     """
-    try:
-        meta = _fetch_chunk_meta_with_retry(peer_host, port, remote_gpu_idx,
-                                            peer_name)
-    except PeerUnreachableError:
-        raise  # Propagate so the poll round skips this entire peer.
-    except Exception:
-        return ("req-err", "?", 0.0, 0.0)
-
     peer_node = meta.get("node_name", "?")
     handle_bytes = base64.urlsafe_b64decode(meta["handle"])
 
@@ -1207,12 +1198,25 @@ def discover_peers() -> list[tuple[str, str]]:
     return peers
 
 
+def _prefetch_peer_chunk_metas(peer_name, peer_host, port):
+    """Fetch chunk metadata for all GPUs on a peer in one batch.
+
+    Returns {gpu_index: meta_dict} or raises PeerUnreachableError.
+    """
+    metas = {}
+    for gpu_idx in range(GPUS_PER_NODE):
+        meta = _fetch_chunk_meta_with_retry(peer_host, port, gpu_idx,
+                                            peer_name)
+        metas[gpu_idx] = meta
+    return metas
+
+
 def _run_one_poll_round():
     """Run one round of all-to-all benchmarks against discovered peers.
 
-    Discovers peers, builds all (peer, remote_gpu, local_gpu) work items
-    in randomized order (to spread lock contention), benchmarks each pair,
-    and logs round stats + results.
+    For each peer, prefetches all GPU chunk handles (one HTTP call per
+    remote GPU), then runs all local×remote GPU benchmarks using the
+    cached handles. This cuts HTTP round-trips from N*M to N per peer.
 
     Raises:
         dns.resolver.NXDOMAIN: If peer DNS does not exist yet.
@@ -1223,11 +1227,23 @@ def _run_one_poll_round():
         log.info("peer poll: no peers discovered yet")
         return
 
-    # Randomize to spread lock contention — without this, all pods try
-    # to lock the same GPUs at the same time.
+    # Prefetch chunk metadata for all peers. Skip unreachable peers.
+    peer_metas = {}  # {pod_name: {gpu_idx: meta_dict}}
+    for pod_name, peer_host in peers:
+        try:
+            peer_metas[pod_name] = _prefetch_peer_chunk_metas(
+                pod_name, peer_host, HTTPD_PORT)
+        except PeerUnreachableError:
+            log.info("skipping peer %s for this round (unreachable)", pod_name)
+        except Exception:
+            log.exception("failed to prefetch chunk metas from %s:", pod_name)
+
+    # Build work items from successfully prefetched peers only.
+    # Randomize to spread lock contention.
     work_items = [
         (pod_name, peer_host, rg, lg)
         for pod_name, peer_host in peers
+        if pod_name in peer_metas
         for rg in range(GPUS_PER_NODE)
         for lg in range(GPUS_PER_NODE)
     ]
@@ -1236,25 +1252,20 @@ def _run_one_poll_round():
     results = {}
     max_lock_wait_ms = 0.0
     benchmark_durations = []
-    skip_peers = set()  # Pod names to skip (DNS unreachable).
 
     for pod_name, peer_host, remote_gpu_idx, local_gpu_idx in work_items:
-        if pod_name in skip_peers:
-            continue
-        peer_idx = pod_name.rsplit("-", 1)[1]
-        log.debug("benchmark %s-g%d -> local-g%d",
-                  pod_name, remote_gpu_idx, local_gpu_idx)
         if SHUTTING_DOWN.is_set():
             log.info("poll round: shutdown requested, finishing after %d/%d benchmarks",
                      len(results), len(work_items))
             break
-        try:
-            status, peer_node, lock_wait, bench_ms = import_and_verify_chunk(
-                pod_name, peer_host, HTTPD_PORT,
-                remote_gpu_idx, local_gpu_idx)
-        except PeerUnreachableError:
-            skip_peers.add(pod_name)
-            continue
+        peer_idx = pod_name.rsplit("-", 1)[1]
+        meta = peer_metas[pod_name][remote_gpu_idx]
+        log.debug("benchmark %s-g%d -> local-g%d",
+                  pod_name, remote_gpu_idx, local_gpu_idx)
+        status, peer_node, lock_wait, bench_ms = _run_single_benchmark(
+            peer_name=pod_name, peer_host=peer_host, port=HTTPD_PORT,
+            remote_gpu_idx=remote_gpu_idx, local_gpu_idx=local_gpu_idx,
+            meta=meta)
         max_lock_wait_ms = max(max_lock_wait_ms, lock_wait)
         if bench_ms > 0:
             benchmark_durations.append(bench_ms)
