@@ -28,7 +28,9 @@ import termios
 import threading
 import time
 import traceback
-
+import tty
+import urllib.error
+import urllib.request
 
 
 # Dashboard diagnostics go to a log file to avoid flickering caused by
@@ -47,7 +49,6 @@ dlog.addHandler(_log_handler)
 dlog.propagate = False  # Don't propagate to root logger — prevents
                         # Rich Live deadlock from concurrent console writes.
 print(f"dashboard log: {_dashboard_log_path}", file=sys.stderr)
-import tty
 
 from rich.console import Console
 from rich.layout import Layout
@@ -113,8 +114,19 @@ def kubectl_json(args, retries=2):
     return None
 
 
+def get_node_ip(node_name):
+    """Look up a node's internal IP via kubectl."""
+    data = kubectl_json(["get", "node", node_name])
+    if not data:
+        return None
+    for addr in data.get("status", {}).get("addresses", []):
+        if addr.get("type") == "InternalIP":
+            return addr["address"]
+    return None
+
+
 def get_atack_pods():
-    """Return list of dicts: [{name, idx, node, status, ip}, ...]."""
+    """Return list of dicts: [{name, idx, node, status, ...}, ...]."""
     data = kubectl_json(["get", "pods", "-l", "app=atack"])
     if not data or "items" not in data:
         return []
@@ -167,46 +179,54 @@ def get_atack_pods():
                     if "liveness" in msg.lower():
                         liveness_failing = True
 
-        # Probe /healthz via the Kubernetes API server proxy. This avoids
-        # needing direct pod IP routing from the dashboard host.
-        cuda_fatal = ""
-        direct_probe = ""
-        if status == "Ready":
-            try:
-                out = subprocess.check_output(
-                    ["kubectl", "get", "--raw",
-                     f"/api/v1/namespaces/{item['metadata'].get('namespace', 'default')}"
-                     f"/pods/{name}:1337/proxy/healthz"],
-                    stderr=subprocess.PIPE, timeout=3,
-                )
-                body = out.decode("utf-8", errors="replace")
-                if body.strip() == "ok":
-                    direct_probe = "ok"
-                else:
-                    direct_probe = body.strip()[:30]
-                    if "ILLEGAL_STATE" in body:
-                        cuda_fatal = body.strip()
-                        liveness_failing = True
-            except subprocess.CalledProcessError as exc:
-                # kubectl returns non-zero for HTTP 500 from the proxy.
-                stderr_text = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
-                if "500" in stderr_text:
-                    direct_probe = "HTTP 500"
-                    liveness_failing = True
-                    if "ILLEGAL_STATE" in stderr_text:
-                        cuda_fatal = stderr_text.strip()[:60]
-                else:
-                    direct_probe = f"err (rc={exc.returncode})"
-            except subprocess.TimeoutExpired:
-                direct_probe = "timeout"
-            except Exception as exc:
-                direct_probe = str(exc)[:20]
-
         pods.append({"name": name, "idx": idx, "node": node, "age": age,
                       "status": status, "liveness_failing": liveness_failing,
-                      "restart_count": restart_count, "cuda_fatal": cuda_fatal,
-                      "direct_probe": direct_probe})
+                      "restart_count": restart_count,
+                      "cuda_fatal": "", "direct_probe": "", "node_ip": None})
     return sorted(pods, key=lambda p: p["node"])
+
+
+def probe_pod_healthz(pod):
+    """Probe a pod's /healthz via its node IP + hostPort.
+
+    Mutates the pod dict in place: sets direct_probe, cuda_fatal,
+    liveness_failing.
+    """
+    node_ip = pod.get("node_ip")
+    if not node_ip or pod["status"] != "Ready":
+        return
+
+    # Use a short socket timeout. urllib does not retry internally.
+    # The timeout applies per socket operation (connect, read), not
+    # wall-clock total, but with a small healthz response (~2 bytes)
+    # the total is effectively bounded at ~0.5s.
+    try:
+        req = urllib.request.Request(f"http://{node_ip}:1337/healthz")
+        with urllib.request.urlopen(req, timeout=0.5) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            if body.strip() == "ok":
+                pod["direct_probe"] = "ok"
+            else:
+                pod["direct_probe"] = body.strip()[:30]
+                if "ILLEGAL_STATE" in body:
+                    pod["cuda_fatal"] = body.strip()
+                    pod["liveness_failing"] = True
+    except urllib.error.HTTPError as exc:
+        pod["direct_probe"] = f"HTTP {exc.code}"
+        if exc.code == 500:
+            pod["liveness_failing"] = True
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            if "ILLEGAL_STATE" in body:
+                pod["cuda_fatal"] = body.strip()[:60]
+    except urllib.error.URLError:
+        pod["direct_probe"] = "unreachable"
+    except OSError:
+        pod["direct_probe"] = "unreachable"
+    except Exception as exc:
+        pod["direct_probe"] = str(exc)[:20]
 
 
 def get_cd_daemons():
@@ -628,6 +648,7 @@ def pods_poller(state, poll_s, linger_s):
     prev_names = set()
     gone = {}
     prev_pods = []
+    node_ips = {}  # {node_name: ip} — resolved once per node, persists.
 
     while True:
         now = time.monotonic()
@@ -637,6 +658,17 @@ def pods_poller(state, poll_s, linger_s):
             dlog.exception("pods_poller failed:")
             time.sleep(poll_s)
             continue
+
+        # Resolve node IPs for any new nodes we haven't seen.
+        for p in fresh:
+            node = p["node"]
+            if node not in node_ips and node != "?":
+                ip = get_node_ip(node)
+                if ip:
+                    node_ips[node] = ip
+                    dlog.warning("resolved node %s → %s", node, ip)
+            p["node_ip"] = node_ips.get(p["node"])
+
         fresh_names = set(p["name"] for p in fresh)
 
         for name in prev_names - fresh_names:
@@ -651,6 +683,10 @@ def pods_poller(state, poll_s, linger_s):
         for name in list(gone.keys()):
             if now - gone[name]["vanished_at"] > linger_s:
                 del gone[name]
+
+        # Probe healthz for each Ready pod via node IP.
+        for p in fresh:
+            probe_pod_healthz(p)
 
         merged = fresh + [g["data"] for g in gone.values()]
         prev_pods = merged

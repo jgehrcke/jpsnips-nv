@@ -60,6 +60,10 @@ spec:
       - name: atack
         image: docker.io/jgehrcke/atack:latest
         command: ["python", "/atack/atack.py"]
+        ports:
+        - containerPort: 1337
+          hostPort: 1337
+          protocol: TCP
         env:
         - name: HTTPD_PORT
           value: "1337"
