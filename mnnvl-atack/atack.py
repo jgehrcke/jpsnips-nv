@@ -636,8 +636,8 @@ def _broadcast_evict_to_peers():
     log.info("shutdown: broadcasting evict-peer to all peers")
     try:
         peers = discover_peers()
-    except Exception:
-        log.warning("shutdown: could not discover peers for evict broadcast")
+    except Exception as exc:
+        log.warning("shutdown: could not discover peers for evict broadcast: %s", exc)
         return
 
     # Send evict requests in parallel — don't let one slow peer delay
