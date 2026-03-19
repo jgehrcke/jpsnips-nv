@@ -1374,7 +1374,8 @@ def _run_one_poll_round():
             peer_metas[pod_name] = _prefetch_peer_chunk_metas(
                 pod_name, peer_host, HTTPD_PORT)
         except PeerUnreachableError:
-            log.info("skipping peer %s for this round (unreachable)", pod_name)
+            log.warning("lost peer %s — DNS resolution failed, skipping for this round",
+                        pod_name)
         except Exception:
             log.exception("failed to prefetch chunk metas from %s:", pod_name)
 
