@@ -187,6 +187,7 @@ def cuda_cleanup():
     return) clean up properly. SIGKILL cannot be caught — in that case the
     CUDA driver handles cleanup at process teardown.
     """
+    t0 = time.monotonic()
     log.info("cuda_cleanup: releasing GPU resources")
 
     # Release cached imports.
@@ -253,7 +254,7 @@ def cuda_cleanup():
         except Exception as exc:
             log.warning("cuda_cleanup: GPU %d context release: %s", gpu_idx, exc)
 
-    log.info("cuda_cleanup: done")
+    log.info("cuda_cleanup: done in %.1f ms", (time.monotonic() - t0) * 1000)
 
 
 def main():
