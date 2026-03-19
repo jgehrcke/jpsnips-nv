@@ -62,8 +62,12 @@ spec:
         command: ["python", "/atack/atack.py"]
         ports:
         - containerPort: 1337
-          hostPort: 1337
-          protocol: TCP
+          hostPort: 1337  # If port 1337 is already in use on the node,
+          protocol: TCP   # the pod will fail to schedule (Unschedulable).
+          # The scheduler treats hostPort as a node-level resource —
+          # only one pod per node can claim a given hostPort. Since we
+          # already enforce one pod per node via podAntiAffinity, this
+          # is safe. Change if 1337 conflicts with other workloads.
         env:
         - name: HTTPD_PORT
           value: "1337"
