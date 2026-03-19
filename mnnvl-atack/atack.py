@@ -31,10 +31,11 @@ import requests
 from cuda.bindings import driver, runtime, nvrtc
 
 log = logging.getLogger()
+logging.Formatter.converter = time.gmtime
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d %(levelname)s: %(message)s",
-    datefmt="%y%m%d-%H:%M:%S",
+    format="%(asctime)s.%(msecs)03dZ %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 
 # Configuration from environment.
