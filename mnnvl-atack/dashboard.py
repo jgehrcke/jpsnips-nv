@@ -6,13 +6,14 @@
 """
 TUI dashboard for atack — All-to-All CUDA Kubernetes test.
 
-Displays three panels:
+Displays four panels:
   - Pods: live status of atack StatefulSet pods
   - ComputeDomain daemons: status of computedomain-daemon pods
-  - Bandwidth matrix: NVLink bandwidth (GB/s) between all pod pairs
+  - ComputeDomain status: node-level CD state
+  - Bandwidth matrix: NVLink bandwidth (GB/s) between all GPU pairs
 
-Uses rich for terminal rendering. Manages kubectl logs -f subprocesses
-per pod to collect bandwidth measurements. Press Ctrl-C to quit.
+Each panel has its own polling thread. Bandwidth data is fetched from each
+pod's /results HTTP endpoint via node IP + hostPort. Press Ctrl-C to quit.
 """
 
 import concurrent.futures
@@ -21,8 +22,6 @@ import fcntl
 import json
 import logging
 import os
-import re
-import select
 import subprocess
 import sys
 import termios
@@ -65,20 +64,6 @@ from rich.text import Text
 POD_POLL_INTERVAL_S = 0.5
 CD_POLL_INTERVAL_S = 0.5
 REFRESH_HZ = 5
-
-# ---------------------------------------------------------------------------
-# Regexes for parsing result log lines
-# ---------------------------------------------------------------------------
-
-# Match: result(0@gb-nvl-156-compute14): ...
-RESULT_RE = re.compile(r"result\((\d+)@([^)]+)\):\s*(.*)")
-# Match: 1@node-g0-g1:818.3 GB/s (multi-GPU format)
-# Groups: peer_idx, peer_node, remote_gpu, local_gpu, value
-PEER_MULTI_RE = re.compile(
-    r"(\d+)@(.+?)-g(\d+)-g(\d+):(\S+(?:\s+GB/s)?)"
-)
-# Match: 1@node:818.3 GB/s (single-GPU backward compat)
-PEER_SINGLE_RE = re.compile(r"(\d+)@([^:]+):(\S+(?:\s+GB/s)?)")
 
 # ---------------------------------------------------------------------------
 # kubectl helpers
@@ -387,22 +372,6 @@ def scale_statefulset(delta):
             dlog.warning("scale error: %s", exc)
 
     threading.Thread(target=_do_scale, daemon=True).start()
-
-
-# ---------------------------------------------------------------------------
-# Log follower management
-# ---------------------------------------------------------------------------
-
-def start_log_follower(pod_name):
-    proc = subprocess.Popen(
-        ["kubectl", "logs", "-f", pod_name],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    fd = proc.stdout.fileno()
-    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-    return proc
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +775,104 @@ def cd_daemons_poller(state, poll_s, linger_s):
     _linger_loop(get_cd_daemons, state, "daemons", poll_s, linger_s)
 
 
+def _fetch_pod_results(node_ip):
+    """Fetch /results from a pod via node IP. Returns parsed JSON or None."""
+    try:
+        req = urllib.request.Request(f"http://{node_ip}:1337/results")
+        with urllib.request.urlopen(req, timeout=0.5) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _pod_results_loop(state, idx, node_ip, uid, poll_s, stop_event):
+    """Dedicated polling loop for one pod. Exits when stop_event is set."""
+    fetch_count = 0
+    while not stop_event.is_set():
+        now = time.monotonic()
+        data = _fetch_pod_results(node_ip)
+        fetch_count += 1
+        if fetch_count <= 3 or fetch_count % 50 == 0:
+            dlog.warning("pod %s fetch #%d: data=%s", idx, fetch_count,
+                         "yes" if data else "no")
+        if data and data.get("results"):
+            latest = data["results"][-1]
+            age_s = latest.get("age_s", 999)
+            benchmarks = latest.get("benchmarks", [])
+
+            for b in benchmarks:
+                peer_idx = str(b["peer_idx"])
+                peer_node = b["peer_node"]
+                remote_gpu = str(b["remote_gpu"])
+                local_gpu = str(b["local_gpu"])
+                val = b["value"]
+                if val.endswith(" GB/s"):
+                    val = val[:-5]
+                row_key = f"{idx}-{local_gpu}"
+                col_key = f"{peer_idx}-{remote_gpu}"
+                if row_key not in state.matrix:
+                    state.matrix[row_key] = {}
+                state.matrix[row_key][col_key] = val
+                state.cell_times[row_key] = now
+                state.pod_nodes[idx] = data.get("node_name", "?")
+                state.pod_nodes[peer_idx] = peer_node
+
+            state.last_result_times[idx] = (age_s, uid)
+            state.timestamp = datetime.datetime.now()
+            state.last_update = now
+
+            if age_s < 60:
+                if state.detected_poll_s is None:
+                    state.detected_poll_s = age_s
+                else:
+                    state.detected_poll_s = (
+                        0.8 * state.detected_poll_s + 0.2 * age_s)
+
+        stop_event.wait(poll_s)
+    dlog.warning("results poller for pod %s (uid=%s) exiting", idx, uid)
+
+
+def results_poller_spawner(state, pods_state, poll_s):
+    """Spawns one dedicated polling thread per pod (identified by UID).
+
+    Watches pods_state for new pods with node IPs and starts a
+    _pod_results_loop thread for each. When a pod disappears from
+    pods_state, its stop_event is set so the thread exits cleanly.
+    """
+    active = {}  # {(idx, uid): (Thread, stop_event)}
+    while True:
+        pods = pods_state.pods
+        live_keys = set()
+        for p in pods:
+            node_ip = p.get("node_ip")
+            if not node_ip:
+                continue
+            key = (p["idx"], p.get("uid"))
+            live_keys.add(key)
+            if key in active:
+                continue
+            stop = threading.Event()
+            t = threading.Thread(
+                target=_pod_results_loop,
+                args=(state, p["idx"], node_ip, p.get("uid"), poll_s, stop),
+                daemon=True,
+            )
+            t.start()
+            active[key] = (t, stop)
+            dlog.warning("started results poller for pod %s (uid=%s)",
+                         p["idx"], p.get("uid"))
+
+        # Stop threads for pods that are gone.
+        for key in list(active):
+            if key not in live_keys:
+                _, stop = active.pop(key)
+                stop.set()
+                dlog.warning("stopping results poller for pod %s (uid=%s)",
+                             key[0], key[1])
+
+        time.sleep(1.0)
+
+
 def cd_status_poller(state, poll_s, linger_s):
     """Polls ComputeDomain status (node list)."""
     prev_node_names = set()
@@ -847,30 +914,24 @@ def cd_status_poller(state, poll_s, linger_s):
 # ---------------------------------------------------------------------------
 
 def main():
-    pod_nodes = {}
-    latest_matrix = {}       # {row_key: {col_key: value_str}} — updated directly
-    matrix_cell_times = {}   # {row_key: monotonic time of last update}
-    matrix_timestamp = None  # When we last got any result line
-    detected_poll_s = None
-    last_result_times = {}
-    result_count = {}
-    bootstrap_intervals = []
     live_matrix_keys = set()
-    detected_gpus_per_node = 1
-
-    followers = {}
-    fd_to_pod = {}
-    line_bufs = {}
-    follower_backoff = {}  # {pod_name: monotonic time of last failure}
-    last_follower_check = 0
 
     LINGER_S = 15.0
+    RESULTS_POLL_S = 0.5
 
     # Each panel has its own state object and polling thread.
     pods_state = PanelState(pods=[], live_pod_indices=set(),
                             sts_info=None)
     cd_daemon_state = PanelState(daemons=[])
     cd_status_state = PanelState(status={"overall": "?", "nodes": []})
+    results_state = PanelState(
+        matrix={},            # {row_key: {col_key: value_str}}
+        cell_times={},        # {row_key: monotonic time}
+        timestamp=None,       # datetime of last result
+        detected_poll_s=None,
+        pod_nodes={},         # {pod_idx: node_name}
+        last_result_times={}, # {pod_idx: (monotonic, uid)}
+    )
 
     threading.Thread(
         target=pods_poller,
@@ -885,6 +946,11 @@ def main():
     threading.Thread(
         target=cd_status_poller,
         args=(cd_status_state, CD_POLL_INTERVAL_S, LINGER_S),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=results_poller_spawner,
+        args=(results_state, pods_state, RESULTS_POLL_S),
         daemon=True,
     ).start()
 
@@ -907,9 +973,9 @@ def main():
                 # Heartbeat: log every 30s to confirm main loop is alive.
                 if now - last_heartbeat > 30:
                     last_heartbeat = now
-                    dlog.warning("heartbeat: main loop alive, %d followers, "
+                    dlog.warning("heartbeat: main loop alive, "
                                  "%d matrix keys",
-                                 len(followers), len(latest_matrix))
+                                 len(results_state.matrix))
 
 
                 # --- Handle keyboard input ---
@@ -928,162 +994,18 @@ def main():
                 atack_pods = pods_state.pods
                 live_pod_indices = pods_state.live_pod_indices
                 sts_info = pods_state.sts_info
-                gpus_per_node = sts_info["gpus_per_node"] if sts_info else detected_gpus_per_node
+                gpus_per_node = sts_info["gpus_per_node"] if sts_info else 1
                 live_matrix_keys = set(
                     f"{idx}-{g}" for idx in live_pod_indices
                     for g in range(gpus_per_node)
                 )
 
-                # --- Manage log followers ---
-                # Only follow pods that are Ready (not Terminated/Pending).
-                # Restart followers for pods whose subprocess has died.
-                if now - last_follower_check > POD_POLL_INTERVAL_S:
-                    last_follower_check = now
-                    ready_names = set(
-                        p["name"] for p in atack_pods if p["status"] == "Ready"
-                    )
-
-                    # Clean up dead followers. Track when they died to
-                    # avoid spam-restarting (backoff: don't retry for 10s).
-                    for pod_name in list(followers.keys()):
-                        proc = followers[pod_name]
-                        if proc.poll() is not None:
-                            fd = proc.stdout.fileno()
-                            fd_to_pod.pop(fd, None)
-                            line_bufs.pop(fd, None)
-                            del followers[pod_name]
-                            follower_backoff[pod_name] = now
-                            dlog.warning("log follower for %s died (rc=%s)",
-                                         pod_name, proc.returncode)
-
-                    # Remove followers for pods no longer Ready.
-                    for pod_name in list(followers.keys()):
-                        if pod_name not in ready_names:
-                            proc = followers[pod_name]
-                            proc.kill()
-                            fd = proc.stdout.fileno()
-                            fd_to_pod.pop(fd, None)
-                            line_bufs.pop(fd, None)
-                            del followers[pod_name]
-                            dlog.warning("killed follower for non-ready pod %s",
-                                         pod_name)
-
-                    # Start followers for new Ready pods (with backoff).
-                    for pod_name in ready_names - set(followers.keys()):
-                        last_fail = follower_backoff.get(pod_name, 0)
-                        if now - last_fail < 10:
-                            continue
-                        dlog.warning("starting log follower for %s", pod_name)
-                        proc = start_log_follower(pod_name)
-                        followers[pod_name] = proc
-                        fd = proc.stdout.fileno()
-                        fd_to_pod[fd] = pod_name
-                        line_bufs[fd] = b""
-
-                # --- Read log data ---
-                stdout_fds = [p.stdout for p in followers.values()
-                              if p.stdout]
-                if stdout_fds:
-                    try:
-                        ready, _, _ = select.select(stdout_fds, [], [], 0)
-                    except (ValueError, OSError) as exc:
-                        # Bad fd from a dead process — clean up on next check.
-                        dlog.warning("select failed: %s", exc)
-                        ready = []
-                    for fd_obj in ready:
-                        fd = fd_obj.fileno()
-                        try:
-                            data = os.read(fd, 65536)
-                        except (IOError, OSError):
-                            continue
-                        if not data:
-                            continue
-
-                        line_bufs[fd] = line_bufs.get(fd, b"") + data
-                        while b"\n" in line_bufs[fd]:
-                            raw_line, line_bufs[fd] = \
-                                line_bufs[fd].split(b"\n", 1)
-                            line_str = raw_line.decode("utf-8",
-                                                       errors="replace")
-
-                            m = RESULT_RE.search(line_str)
-                            if not m:
-                                continue
-
-                            pod_idx = m.group(1)
-                            node_name = m.group(2)
-                            raw = m.group(3)
-                            dlog.info("result line from pod %s", pod_idx)
-
-                            pod_nodes[pod_idx] = node_name
-                            matrix_timestamp = datetime.datetime.now()
-
-                            # Parse peer entries and update latest_matrix
-                            # directly. No round accumulation — every
-                            # result line immediately updates the matrix.
-                            multi_matches = list(PEER_MULTI_RE.finditer(raw))
-                            if multi_matches:
-                                seen_gpus = set()
-                                for pm in multi_matches:
-                                    peer_idx = pm.group(1)
-                                    peer_node = pm.group(2)
-                                    remote_gpu = pm.group(3)
-                                    local_gpu = pm.group(4)
-                                    val = pm.group(5)
-                                    pod_nodes[peer_idx] = peer_node
-                                    if val.endswith(" GB/s"):
-                                        val = val[:-5]
-                                    row_key = f"{pod_idx}-{local_gpu}"
-                                    col_key = f"{peer_idx}-{remote_gpu}"
-                                    if row_key not in latest_matrix:
-                                        latest_matrix[row_key] = {}
-                                    latest_matrix[row_key][col_key] = val
-                                    matrix_cell_times[row_key] = time.monotonic()
-                                    seen_gpus.add(int(local_gpu))
-                                    seen_gpus.add(int(remote_gpu))
-                                new_gpn = max(seen_gpus) + 1
-                                if new_gpn > detected_gpus_per_node:
-                                    detected_gpus_per_node = new_gpn
-                                    live_matrix_keys = set(
-                                        f"{idx}-{g}" for idx in live_pod_indices
-                                        for g in range(detected_gpus_per_node)
-                                    )
-                            else:
-                                # Single-GPU backward compat.
-                                row_key = f"{pod_idx}-0"
-                                if row_key not in latest_matrix:
-                                    latest_matrix[row_key] = {}
-                                for pm in PEER_SINGLE_RE.finditer(raw):
-                                    peer_idx = pm.group(1)
-                                    peer_node = pm.group(2)
-                                    val = pm.group(3)
-                                    pod_nodes[peer_idx] = peer_node
-                                    if val.endswith(" GB/s"):
-                                        val = val[:-5]
-                                    latest_matrix[row_key][f"{peer_idx}-0"] = val
-                                matrix_cell_times[row_key] = time.monotonic()
-
-                            # Auto-detect poll interval from result cadence.
-                            result_now = time.monotonic()
-                            result_count[pod_idx] = result_count.get(pod_idx, 0) + 1
-                            prev = last_result_times.get(pod_idx)
-                            if prev and result_count[pod_idx] > 2:
-                                interval = result_now - prev[0]
-                                if 0.5 < interval < 60:
-                                    if detected_poll_s is None:
-                                        bootstrap_intervals.append(interval)
-                                        if len(bootstrap_intervals) >= 4:
-                                            s = sorted(bootstrap_intervals)
-                                            detected_poll_s = s[len(s) // 2]
-                                    else:
-                                        detected_poll_s = 0.8 * detected_poll_s + 0.2 * interval
-                            # Store (timestamp, uid) so we can detect pod replacements.
-                            pod_uid = None
-                            for p in pods_state.pods:
-                                if p["idx"] == pod_idx:
-                                    pod_uid = p.get("uid")
-                                    break
-                            last_result_times[pod_idx] = (result_now, pod_uid)
+                # Read matrix data from results poller.
+                latest_matrix = results_state.matrix
+                matrix_cell_times = results_state.cell_times
+                matrix_timestamp = results_state.timestamp
+                detected_poll_s = results_state.detected_poll_s
+                pod_nodes = results_state.pod_nodes
 
                 # Remove matrix entries for pods no longer live.
                 for key in list(latest_matrix.keys()):
@@ -1095,16 +1017,13 @@ def main():
                     matrix_timestamp = None
 
                 # --- Render ---
-                # Enrich pod data with last-result age from log parsing.
-                # Ignore stale entries where the pod UID changed (pod was
-                # replaced — same index, different pod).
                 now_mono = time.monotonic()
                 display_pods = []
-                for p in pods_state.pods:
+                for p in atack_pods:
                     p2 = dict(p)
-                    entry = last_result_times.get(p["idx"])
+                    entry = results_state.last_result_times.get(p["idx"])
                     if entry and entry[1] == p.get("uid"):
-                        p2["last_result_ago"] = int(now_mono - entry[0])
+                        p2["last_result_ago"] = int(entry[0])
                     else:
                         p2["last_result_ago"] = None
                     display_pods.append(p2)
@@ -1127,11 +1046,6 @@ def main():
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
             except Exception:
                 dlog.warning("failed to restore terminal settings")
-            for proc in followers.values():
-                try:
-                    proc.kill()
-                except Exception:
-                    dlog.warning("failed to kill follower process")
 
     # Print final status to stdout (visible after TUI exits).
     dlog.warning("dashboard exiting")
