@@ -57,6 +57,7 @@ import atexit
 import base64
 import concurrent.futures
 import ctypes
+import datetime
 import json
 import random
 import logging
@@ -155,6 +156,11 @@ FATAL_CUDA_ERROR = None  # Set to error string on fatal error
 # returns 500 if no result was produced within 3× the poll interval,
 # indicating the pod is stuck (hung CUDA call, dead thread, etc.).
 LAST_RESULT_TIME = None       # Set after ANY round (even partial).
+
+# Ring buffer of recent round results for the /results endpoint.
+# Each entry: {timestamp, round_time_s, benchmarks, total, ok, errors}
+RESULTS_RING = []             # Appended after each round.
+RESULTS_RING_MAX = 20         # Keep last 20 rounds.
 
 # Graceful shutdown coordination. Set by SIGTERM/SIGINT handler.
 # Components check this to wind down cleanly.
@@ -1541,9 +1547,22 @@ def _run_one_poll_round():
     global LAST_RESULT_TIME
     LAST_RESULT_TIME = time.monotonic()
 
-
-
     round_dur = time.monotonic() - round_t0
+
+    # Append to ring buffer for /results endpoint.
+    ok_count = sum(1 for v in results.values()
+                   if not any(tag in v for tag in _error_tags))
+    RESULTS_RING.append({
+        "timestamp": datetime.datetime.now(datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "round_time_s": round(round_dur, 2),
+        "benchmarks": dict(sorted(results.items())),
+        "total": len(results),
+        "ok": ok_count,
+        "errors": len(results) - ok_count,
+    })
+    if len(RESULTS_RING) > RESULTS_RING_MAX:
+        RESULTS_RING[:] = RESULTS_RING[-RESULTS_RING_MAX:]
     my_idx = K8S_PODNAME.rsplit("-", 1)[1]
     parts = [f"{k}:{v}" for k, v in sorted(results.items())]
     log.info("result(%s@%s): round_time=%.1fs %s",
@@ -1618,6 +1637,31 @@ class HTTPHandler(BaseHTTPRequestHandler):
         return parsed, params, gpu_idx
 
     def do_GET(self):
+        if "/results" in self.path:
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            n = 1
+            try:
+                n_vals = params.get("n")
+                if n_vals:
+                    n = max(1, min(int(n_vals[0]), RESULTS_RING_MAX))
+            except (ValueError, IndexError):
+                pass
+            tail = RESULTS_RING[-n:] if RESULTS_RING else []
+            body = json.dumps({
+                "pod_name": K8S_PODNAME,
+                "node_name": K8S_NODENAME,
+                "gpus_per_node": GPUS_PER_NODE,
+                "results": tail,
+                "fatal_cuda_error": FATAL_CUDA_ERROR,
+                "shutting_down": SHUTTING_DOWN.is_set(),
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if "/healthz" in self.path:
             if FATAL_CUDA_ERROR:
                 self._respond(500, f"fatal: {FATAL_CUDA_ERROR}")
