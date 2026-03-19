@@ -53,7 +53,6 @@ from rich.text import Text
 # Config
 # ---------------------------------------------------------------------------
 
-ROUND_WINDOW_S = 2.5
 POD_POLL_INTERVAL_S = 0.5
 CD_POLL_INTERVAL_S = 0.5
 REFRESH_HZ = 5
@@ -403,8 +402,7 @@ def build_cd_status_panel(cd_status):
 
 
 def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
-                       matrix_timestamp, matrix_round_num, round_counter,
-                       detected_poll_s):
+                       matrix_timestamp, detected_poll_s):
     title = "Bandwidth matrix (GB/s)"
 
     parts = []
@@ -457,21 +455,15 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
         node = node_map.get(pod_nodes.get(pod_idx, "?"), "?")
         row_label = f"{pod_idx}-{node}-{gpu_idx}"
         peers = latest_matrix.get(row_key, {})
-        row_round = matrix_round_num.get(row_key, 0)
-        is_stale = round_counter - row_round > 1
 
         row_pod = row_key.split("-", 1)[0]
         cells = [row_label]
         for c in cols:
             col_pod = c.split("-", 1)[0]
-            # Same pod = intra-node pair, no cross-pod measurement.
             if col_pod == row_pod:
                 cells.append(Text("—", style="dim"))
             elif not peers:
                 cells.append(Text("?", style="yellow"))
-            elif is_stale:
-                val = peers.get(c, "?")
-                cells.append(Text(f"{val} !", style="dim"))
             else:
                 val = peers.get(c, "?")
                 if val == "?":
@@ -496,8 +488,7 @@ def build_header():
 
 
 def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
-                 live_matrix_keys, matrix_timestamp, matrix_round_num,
-                 round_counter, detected_poll_s):
+                 live_matrix_keys, matrix_timestamp, detected_poll_s):
     mid_row_h = max(len(cd_daemons), len(cd_status["nodes"]), 1) + 4
 
     layout = Layout()
@@ -517,8 +508,7 @@ def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
     layout["cd_status"].update(build_cd_status_panel(cd_status))
     layout["matrix"].update(
         build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
-                           matrix_timestamp, matrix_round_num, round_counter,
-                           detected_poll_s))
+                           matrix_timestamp, detected_poll_s))
     return layout
 
 
@@ -664,12 +654,8 @@ def cd_status_poller(state, poll_s, linger_s):
 
 def main():
     pod_nodes = {}
-    current_round = {}
-    round_start = None
-    latest_matrix = {}
-    matrix_round_num = {}
-    round_counter = 0
-    matrix_timestamp = None
+    latest_matrix = {}       # {row_key: {col_key: value_str}} — updated directly
+    matrix_timestamp = None  # When we last got any result line
     detected_poll_s = None
     last_result_times = {}
     result_count = {}
@@ -740,15 +726,15 @@ def main():
                 )
 
                 # --- Manage log followers ---
+                # Only follow pods that are Ready (not Terminated/Pending).
+                # Restart followers for pods whose subprocess has died.
                 if now - last_follower_check > POD_POLL_INTERVAL_S:
                     last_follower_check = now
-                    current_names = set(p["name"] for p in atack_pods)
-                    for pod_name in current_names - set(followers.keys()):
-                        proc = start_log_follower(pod_name)
-                        followers[pod_name] = proc
-                        fd = proc.stdout.fileno()
-                        fd_to_pod[fd] = pod_name
-                        line_bufs[fd] = b""
+                    ready_names = set(
+                        p["name"] for p in atack_pods if p["status"] == "Ready"
+                    )
+
+                    # Clean up dead followers first.
                     for pod_name in list(followers.keys()):
                         proc = followers[pod_name]
                         if proc.poll() is not None:
@@ -756,6 +742,29 @@ def main():
                             fd_to_pod.pop(fd, None)
                             line_bufs.pop(fd, None)
                             del followers[pod_name]
+                            dlog.warning("log follower for %s died (rc=%s)",
+                                         pod_name, proc.returncode)
+
+                    # Remove followers for pods no longer Ready.
+                    for pod_name in list(followers.keys()):
+                        if pod_name not in ready_names:
+                            proc = followers[pod_name]
+                            proc.kill()
+                            fd = proc.stdout.fileno()
+                            fd_to_pod.pop(fd, None)
+                            line_bufs.pop(fd, None)
+                            del followers[pod_name]
+                            dlog.warning("killed follower for non-ready pod %s",
+                                         pod_name)
+
+                    # Start followers for new Ready pods.
+                    for pod_name in ready_names - set(followers.keys()):
+                        dlog.warning("starting log follower for %s", pod_name)
+                        proc = start_log_follower(pod_name)
+                        followers[pod_name] = proc
+                        fd = proc.stdout.fileno()
+                        fd_to_pod[fd] = pod_name
+                        line_bufs[fd] = b""
 
                 # --- Read log data ---
                 stdout_fds = [p.stdout for p in followers.values()
@@ -787,14 +796,11 @@ def main():
                             raw = m.group(3)
 
                             pod_nodes[pod_idx] = node_name
+                            matrix_timestamp = datetime.datetime.now()
 
-                            # Parse peer entries. Multi-GPU format:
-                            #   1@node-g0-g1:818.3 GB/s
-                            #   → col_key="1-0" (peer+remote_gpu)
-                            #   → row_key="reporter-local_gpu"
-                            # Single-GPU fallback:
-                            #   1@node:818.3 GB/s
-                            #   → col_key="1-0", row_key="reporter-0"
+                            # Parse peer entries and update latest_matrix
+                            # directly. No round accumulation — every
+                            # result line immediately updates the matrix.
                             multi_matches = list(PEER_MULTI_RE.finditer(raw))
                             if multi_matches:
                                 seen_gpus = set()
@@ -809,22 +815,23 @@ def main():
                                         val = val[:-5]
                                     row_key = f"{pod_idx}-{local_gpu}"
                                     col_key = f"{peer_idx}-{remote_gpu}"
-                                    if row_key not in current_round:
-                                        current_round[row_key] = {}
-                                    current_round[row_key][col_key] = val
+                                    if row_key not in latest_matrix:
+                                        latest_matrix[row_key] = {}
+                                    latest_matrix[row_key][col_key] = val
                                     seen_gpus.add(int(local_gpu))
                                     seen_gpus.add(int(remote_gpu))
                                 new_gpn = max(seen_gpus) + 1
                                 if new_gpn > detected_gpus_per_node:
                                     detected_gpus_per_node = new_gpn
-                                    # Rebuild matrix keys with new GPU count.
                                     live_matrix_keys = set(
                                         f"{idx}-{g}" for idx in live_pod_indices
                                         for g in range(detected_gpus_per_node)
                                     )
                             else:
                                 # Single-GPU backward compat.
-                                peers = {}
+                                row_key = f"{pod_idx}-0"
+                                if row_key not in latest_matrix:
+                                    latest_matrix[row_key] = {}
                                 for pm in PEER_SINGLE_RE.finditer(raw):
                                     peer_idx = pm.group(1)
                                     peer_node = pm.group(2)
@@ -832,23 +839,15 @@ def main():
                                     pod_nodes[peer_idx] = peer_node
                                     if val.endswith(" GB/s"):
                                         val = val[:-5]
-                                    peers[f"{peer_idx}-0"] = val
-                                current_round[f"{pod_idx}-0"] = peers
-                            if round_start is None:
-                                round_start = time.monotonic()
+                                    latest_matrix[row_key][f"{peer_idx}-0"] = val
 
                             # Auto-detect poll interval from result cadence.
-                            # Skip first two results per pod — the initial
-                            # intervals are unreliable due to log follower
-                            # buffering and startup timing.
                             result_now = time.monotonic()
                             result_count[pod_idx] = result_count.get(pod_idx, 0) + 1
                             if pod_idx in last_result_times and result_count[pod_idx] > 2:
                                 interval = result_now - last_result_times[pod_idx]
                                 if 0.5 < interval < 60:
                                     if detected_poll_s is None:
-                                        # Collect intervals, seed from median
-                                        # once we have enough samples.
                                         bootstrap_intervals.append(interval)
                                         if len(bootstrap_intervals) >= 4:
                                             s = sorted(bootstrap_intervals)
@@ -857,38 +856,11 @@ def main():
                                         detected_poll_s = 0.8 * detected_poll_s + 0.2 * interval
                             last_result_times[pod_idx] = result_now
 
-                            # Round complete when all matrix keys reported.
-                            if (live_matrix_keys and
-                                    live_matrix_keys
-                                    <= set(current_round.keys())):
-                                round_counter += 1
-                                latest_matrix.update(current_round)
-                                for pod_idx in current_round:
-                                    matrix_round_num[pod_idx] = round_counter
-                                matrix_timestamp = datetime.datetime.now()
-                                current_round = {}
-                                round_start = None
-
-                # Timeout fallback: merge what we have so far.
-                # Use 3x detected poll interval, or ROUND_WINDOW_S as default.
-                round_timeout = (detected_poll_s * 3) if detected_poll_s else ROUND_WINDOW_S
-                if round_start is not None:
-                    if time.monotonic() - round_start >= round_timeout:
-                        round_counter += 1
-                        latest_matrix.update(current_round)
-                        for pod_idx in current_round:
-                            matrix_round_num[pod_idx] = round_counter
-                        matrix_timestamp = datetime.datetime.now()
-                        current_round = {}
-                        round_start = None
-
-                # Remove matrix entries that are no longer live.
+                # Remove matrix entries for pods no longer live.
                 for key in list(latest_matrix.keys()):
                     if key not in live_matrix_keys:
                         del latest_matrix[key]
-                        matrix_round_num.pop(key, None)
 
-                # Reset timestamp when matrix is empty (all pods gone).
                 if not latest_matrix:
                     matrix_timestamp = None
 
@@ -896,8 +868,7 @@ def main():
                 live.update(build_layout(
                     pods_state.pods, cd_daemon_state.daemons,
                     cd_status_state.status, latest_matrix, pod_nodes,
-                    live_matrix_keys, matrix_timestamp, matrix_round_num,
-                    round_counter, detected_poll_s))
+                    live_matrix_keys, matrix_timestamp, detected_poll_s))
 
                 time.sleep(1.0 / REFRESH_HZ)
 
