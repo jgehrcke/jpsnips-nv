@@ -157,6 +157,7 @@ SHARED_CHUNK_ALLOCS = {}
 # imported an old fabric handle and could still be doing a DtoD copy from it.
 # Freeing immediately would cause CUDA_ERROR_INVALID_HANDLE or SIGSEGV.
 # Chunks are freed only after CHUNK_RETIRE_S seconds (3 refresh cycles).
+CHUNK_REFRESH_INTERVAL_S = 30
 CHUNK_RETIRE_S = CHUNK_REFRESH_INTERVAL_S * 3
 RETIRED_CHUNKS = []  # [(gpu_idx, va_ptr, alloc_size, alloc_handle, retire_time)]
 
@@ -600,8 +601,6 @@ def start_gpu_lock_watchdog():
     t = threading.Thread(target=watchdog, daemon=True)
     t.start()
 
-
-CHUNK_REFRESH_INTERVAL_S = 30
 
 
 def prepare_all_shared_chunks():
