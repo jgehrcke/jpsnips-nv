@@ -55,6 +55,7 @@ Three mechanisms keep the locking robust:
 
 import atexit
 import base64
+import concurrent.futures
 import ctypes
 import json
 import random
@@ -1211,12 +1212,53 @@ def _prefetch_peer_chunk_metas(peer_name, peer_host, port):
     return metas
 
 
+def _benchmark_one_peer(pod_name, peer_host, port, peer_metas):
+    """Run all GPU-pair benchmarks against one peer. Called from a thread.
+
+    Returns (results_dict, max_lock_wait_ms, benchmark_durations_list).
+    """
+    metas = peer_metas.get(pod_name)
+    if metas is None:
+        return {}, 0.0, []
+
+    peer_idx = pod_name.rsplit("-", 1)[1]
+    work_items = [
+        (rg, lg) for rg in range(GPUS_PER_NODE)
+        for lg in range(GPUS_PER_NODE)
+    ]
+    random.shuffle(work_items)
+
+    results = {}
+    max_lock_wait_ms = 0.0
+    benchmark_durations = []
+
+    for remote_gpu_idx, local_gpu_idx in work_items:
+        if SHUTTING_DOWN.is_set():
+            log.info("peer %s: shutdown requested, finishing after %d/%d benchmarks",
+                     pod_name, len(results), len(work_items))
+            break
+        meta = metas[remote_gpu_idx]
+        log.debug("benchmark %s-g%d -> local-g%d",
+                  pod_name, remote_gpu_idx, local_gpu_idx)
+        status, peer_node, lock_wait, bench_ms = _run_single_benchmark(
+            peer_name=pod_name, peer_host=peer_host, port=port,
+            remote_gpu_idx=remote_gpu_idx, local_gpu_idx=local_gpu_idx,
+            meta=meta)
+        max_lock_wait_ms = max(max_lock_wait_ms, lock_wait)
+        if bench_ms > 0:
+            benchmark_durations.append(bench_ms)
+        key = f"{peer_idx}@{peer_node}-g{remote_gpu_idx}-g{local_gpu_idx}"
+        results[key] = status
+
+    return results, max_lock_wait_ms, benchmark_durations
+
+
 def _run_one_poll_round():
     """Run one round of all-to-all benchmarks against discovered peers.
 
-    For each peer, prefetches all GPU chunk handles (one HTTP call per
-    remote GPU), then runs all local×remote GPU benchmarks using the
-    cached handles. This cuts HTTP round-trips from N*M to N per peer.
+    Prefetches chunk handles for all peers, then benchmarks each peer
+    in parallel (one thread per peer). Round time scales with the
+    slowest peer, not the sum of all peers.
 
     Raises:
         dns.resolver.NXDOMAIN: If peer DNS does not exist yet.
@@ -1228,7 +1270,7 @@ def _run_one_poll_round():
         return
 
     # Prefetch chunk metadata for all peers. Skip unreachable peers.
-    peer_metas = {}  # {pod_name: {gpu_idx: meta_dict}}
+    peer_metas = {}
     for pod_name, peer_host in peers:
         try:
             peer_metas[pod_name] = _prefetch_peer_chunk_metas(
@@ -1238,39 +1280,32 @@ def _run_one_poll_round():
         except Exception:
             log.exception("failed to prefetch chunk metas from %s:", pod_name)
 
-    # Build work items from successfully prefetched peers only.
-    # Randomize to spread lock contention.
-    work_items = [
-        (pod_name, peer_host, rg, lg)
-        for pod_name, peer_host in peers
-        if pod_name in peer_metas
-        for rg in range(GPUS_PER_NODE)
-        for lg in range(GPUS_PER_NODE)
-    ]
-    random.shuffle(work_items)
+    if not peer_metas:
+        return
 
+    # Benchmark all peers in parallel — one thread per peer.
+    # Local GPU locks handle contention for shared local GPUs.
     results = {}
     max_lock_wait_ms = 0.0
     benchmark_durations = []
 
-    for pod_name, peer_host, remote_gpu_idx, local_gpu_idx in work_items:
-        if SHUTTING_DOWN.is_set():
-            log.info("poll round: shutdown requested, finishing after %d/%d benchmarks",
-                     len(results), len(work_items))
-            break
-        peer_idx = pod_name.rsplit("-", 1)[1]
-        meta = peer_metas[pod_name][remote_gpu_idx]
-        log.debug("benchmark %s-g%d -> local-g%d",
-                  pod_name, remote_gpu_idx, local_gpu_idx)
-        status, peer_node, lock_wait, bench_ms = _run_single_benchmark(
-            peer_name=pod_name, peer_host=peer_host, port=HTTPD_PORT,
-            remote_gpu_idx=remote_gpu_idx, local_gpu_idx=local_gpu_idx,
-            meta=meta)
-        max_lock_wait_ms = max(max_lock_wait_ms, lock_wait)
-        if bench_ms > 0:
-            benchmark_durations.append(bench_ms)
-        key = f"{peer_idx}@{peer_node}-g{remote_gpu_idx}-g{local_gpu_idx}"
-        results[key] = status
+    reachable_peers = [(pn, ph) for pn, ph in peers if pn in peer_metas]
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(reachable_peers)) as pool:
+        futures = {
+            pool.submit(_benchmark_one_peer, pod_name, peer_host,
+                        HTTPD_PORT, peer_metas): pod_name
+            for pod_name, peer_host in reachable_peers
+        }
+        for future in concurrent.futures.as_completed(futures):
+            pod_name = futures[future]
+            try:
+                peer_results, peer_lock_wait, peer_durations = future.result()
+                results.update(peer_results)
+                max_lock_wait_ms = max(max_lock_wait_ms, peer_lock_wait)
+                benchmark_durations.extend(peer_durations)
+            except Exception:
+                log.exception("peer %s benchmark thread failed:", pod_name)
 
     if benchmark_durations:
         bmin = min(benchmark_durations)
