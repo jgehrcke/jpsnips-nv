@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["rich", "requests"]
+# dependencies = ["rich"]
 # ///
 """
 TUI dashboard for atack — All-to-All CUDA Kubernetes test.
@@ -29,7 +29,7 @@ import threading
 import time
 import traceback
 
-import requests as requests_lib
+
 
 # Dashboard diagnostics go to a log file to avoid flickering caused by
 # stderr writes bleeding through the TUI's alternate screen buffer.
@@ -149,39 +149,51 @@ def get_atack_pods():
         else:
             status = phase
 
-        # Kubelet's liveness probe status from pod conditions.
+        # Kubelet's liveness probe status. Only look at current pod
+        # conditions (not lastState, which is historical and persists
+        # forever after a restart — causes false positives).
         liveness_failing = False
-        for cond in item["status"].get("conditions", []):
-            if cond.get("type") == "Ready" and cond.get("status") == "False":
-                msg = cond.get("message", "")
-                if "liveness" in msg.lower() or "probe" in msg.lower():
-                    liveness_failing = True
-        # Also detect restart from liveness failure.
-        if cstatuses:
-            last_state = cstatuses[0].get("lastState", {})
-            terminated = last_state.get("terminated", {})
-            if terminated.get("reason") == "Error" and restart_count > 0:
-                liveness_failing = True
+        if status == "Ready":
+            liveness_failing = False  # Kubelet says Ready = liveness OK.
+        else:
+            # Pod not ready — check if it's specifically due to liveness.
+            for cond in item["status"].get("conditions", []):
+                if cond.get("type") == "Ready" and cond.get("status") == "False":
+                    msg = cond.get("message", "")
+                    if "liveness" in msg.lower():
+                        liveness_failing = True
 
-        # Direct HTTP probe of /healthz.
+        # Probe /healthz via the Kubernetes API server proxy. This avoids
+        # needing direct pod IP routing from the dashboard host.
         cuda_fatal = ""
         direct_probe = ""
-        pod_ip = item["status"].get("podIP")
-        if pod_ip and status == "Ready":
+        if status == "Ready":
             try:
-                resp = requests_lib.get(f"http://{pod_ip}:1337/healthz", timeout=(0.5, 1))
-                if resp.status_code == 200:
+                out = subprocess.check_output(
+                    ["kubectl", "get", "--raw",
+                     f"/api/v1/namespaces/{item['metadata'].get('namespace', 'default')}"
+                     f"/pods/{name}:1337/proxy/healthz"],
+                    stderr=subprocess.PIPE, timeout=3,
+                )
+                body = out.decode("utf-8", errors="replace")
+                if body.strip() == "ok":
                     direct_probe = "ok"
-                elif resp.status_code == 500:
-                    direct_probe = f"HTTP 500"
-                    liveness_failing = True
-                    if "ILLEGAL_STATE" in resp.text:
-                        cuda_fatal = resp.text
                 else:
-                    direct_probe = f"HTTP {resp.status_code}"
-            except requests_lib.exceptions.ConnectionError:
-                direct_probe = "conn refused"
-            except requests_lib.exceptions.Timeout:
+                    direct_probe = body.strip()[:30]
+                    if "ILLEGAL_STATE" in body:
+                        cuda_fatal = body.strip()
+                        liveness_failing = True
+            except subprocess.CalledProcessError as exc:
+                # kubectl returns non-zero for HTTP 500 from the proxy.
+                stderr_text = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
+                if "500" in stderr_text:
+                    direct_probe = "HTTP 500"
+                    liveness_failing = True
+                    if "ILLEGAL_STATE" in stderr_text:
+                        cuda_fatal = stderr_text.strip()[:60]
+                else:
+                    direct_probe = f"err (rc={exc.returncode})"
+            except subprocess.TimeoutExpired:
                 direct_probe = "timeout"
             except Exception as exc:
                 direct_probe = str(exc)[:20]
