@@ -51,6 +51,25 @@ Three mechanisms keep the locking robust:
     remotely-acquired lock held longer than 30 seconds, guarding
     against crashed clients that acquired a lock but never released it.
     Local locks (held for ~5 ms) are not subject to the watchdog.
+
+Graceful shutdown (SIGTERM/SIGINT):
+  1. SHUTTING_DOWN event is set. The HTTP handler immediately starts
+     rejecting /prepare-chunk (503) and /lock-gpu (503), preventing
+     new benchmarks from importing our handles. /evict-peer and
+     /unlock-gpu remain accepted throughout shutdown.
+  2. Wait for remotely-held local GPU locks to be released. A peer
+     holding our lock is mid-DtoD from our memory — we must wait for
+     that to complete before freeing.
+  3. Broadcast POST /evict-peer to all peers. Each peer unmaps and
+     releases its cached imports of our fabric handles. The HTTP
+     response confirms the peer has completed cleanup, so when the
+     broadcast returns no peer holds any reference to our GPU memory.
+  4. cuda_cleanup releases all local CUDA resources: import cache
+     entries (our cached imports of peer handles), shared chunks,
+     verify buffers, and device contexts. Idempotent — also registered
+     via atexit as a safety net.
+  5. A hard-exit watchdog thread kills the process after 10s if atexit
+     cleanup hangs (e.g. a CUDA driver call blocks indefinitely).
 """
 
 import atexit
