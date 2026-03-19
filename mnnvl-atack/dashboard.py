@@ -357,6 +357,7 @@ def build_pods_table(atack_pods):
     table.add_column("Node")
     table.add_column("Age")
     table.add_column("Status")
+    table.add_column("Restarts")
     table.add_column("Direct Probe")
     table.add_column("Liveness")
     table.add_column("Last Result")
@@ -385,12 +386,15 @@ def build_pods_table(atack_pods):
             liveness = Text("ok", style="green")
         else:
             liveness = Text("")
+        restarts = p.get("restart_count", 0)
+        restarts_text = Text(str(restarts), style="red" if restarts > 0 else "")
         table.add_row(p["idx"], p["name"], p["node"], p.get("age", ""),
                       Text(p["status"], style=color),
-                      probe_text, liveness, last_result_text, cuda_fatal)
+                      restarts_text, probe_text, liveness,
+                      last_result_text, cuda_fatal)
 
     if not atack_pods:
-        table.add_row("—", "no pods", "", "", "", "", "", "", "")
+        table.add_row("—", "no pods", "", "", "", "", "", "", "", "")
 
     return Panel(table, title="Workload Pods", title_align="left",
                  border_style="blue", padding=(0, 1))

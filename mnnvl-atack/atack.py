@@ -909,10 +909,14 @@ def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
     peer_name = peer_host.split(".")[0]
     ensure_cuda_context(local_gpu_idx)
 
-    imported_handle = import_fabric_handle(handle_bytes)
-    va_ptr = map_imported_chunk(imported_handle, alloc_size, local_gpu_idx)
+    imported_handle = None
+    va_ptr = None
+    remote_token = None
 
     try:
+        imported_handle = import_fabric_handle(handle_bytes)
+        va_ptr = map_imported_chunk(imported_handle, alloc_size, local_gpu_idx)
+
         remote_token, lock_wait_ms = acquire_gpu_lock_pair(
             peer_name, peer_host, port, remote_gpu_idx, local_gpu_idx)
         try:
@@ -923,8 +927,17 @@ def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
             release_remote_gpu_lock(peer_host, port, remote_gpu_idx,
                                     remote_token)
     finally:
-        unmap_imported_chunk(va_ptr, alloc_size, imported_handle)
-        pop_cuda_context()
+        # Guard each cleanup call individually. After CUDA_ERROR_ILLEGAL_STATE,
+        # further CUDA driver calls may segfault — catch and log rather than
+        # letting the process die.
+        try:
+            unmap_imported_chunk(va_ptr, alloc_size, imported_handle)
+        except Exception:
+            log.warning("cleanup: unmap_imported_chunk failed (ignored)")
+        try:
+            pop_cuda_context()
+        except Exception:
+            log.warning("cleanup: pop_cuda_context failed (ignored)")
 
     return result, lock_wait_ms, benchmark_ms
 
