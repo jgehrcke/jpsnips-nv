@@ -18,16 +18,28 @@ per pod to collect bandwidth measurements. Press Ctrl-C to quit.
 import datetime
 import fcntl
 import json
+import logging
 import os
 import re
 import select
 import subprocess
 import sys
-
-import requests as requests_lib  # Avoid shadowing with local vars.
 import termios
 import threading
 import time
+import traceback
+
+import requests as requests_lib
+
+# Dashboard diagnostics go to stderr so they survive TUI crashes and
+# don't interfere with Rich's screen rendering on stdout.
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.WARNING,
+    format="%(asctime)s dashboard %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+dlog = logging.getLogger("dashboard")
 import tty
 
 from rich.console import Console
@@ -82,17 +94,14 @@ def kubectl_json(args, retries=2):
             )
             return json.loads(out)
         except subprocess.TimeoutExpired:
-            print(f"dashboard: kubectl timeout ({KUBECTL_TIMEOUT_S}s) "
-                  f"attempt {attempt}/{retries}: {cmd_str}",
-                  file=sys.stderr)
+            dlog.warning("kubectl timeout (%ds) attempt %d/%d: %s",
+                         KUBECTL_TIMEOUT_S, attempt, retries, cmd_str)
         except subprocess.CalledProcessError as exc:
-            print(f"dashboard: kubectl error (rc={exc.returncode}) "
-                  f"attempt {attempt}/{retries}: {cmd_str}",
-                  file=sys.stderr)
+            dlog.warning("kubectl error (rc=%d) attempt %d/%d: %s",
+                         exc.returncode, attempt, retries, cmd_str)
         except json.JSONDecodeError:
-            print(f"dashboard: kubectl returned invalid JSON "
-                  f"attempt {attempt}/{retries}: {cmd_str}",
-                  file=sys.stderr)
+            dlog.warning("kubectl invalid JSON attempt %d/%d: %s",
+                         attempt, retries, cmd_str)
         if attempt < retries:
             time.sleep(0.5)
     return None
@@ -245,7 +254,7 @@ def scale_statefulset(delta):
                 stderr=subprocess.PIPE, timeout=5,
             )
         except Exception as exc:
-            print(f"scale error: {exc}", file=sys.stderr)
+            dlog.warning("scale error: %s", exc)
 
     threading.Thread(target=_do_scale, daemon=True).start()
 
@@ -541,7 +550,12 @@ def _linger_loop(fetch_fn, state, field, poll_s, linger_s, name_key="name"):
 
     while True:
         now = time.monotonic()
-        fresh = fetch_fn()
+        try:
+            fresh = fetch_fn()
+        except Exception:
+            dlog.exception("_linger_loop(%s) failed:", field)
+            time.sleep(poll_s)
+            continue
         fresh_names = set(item[name_key] for item in fresh)
 
         for name in prev_names - fresh_names:
@@ -572,7 +586,12 @@ def pods_poller(state, poll_s, linger_s):
 
     while True:
         now = time.monotonic()
-        fresh = get_atack_pods()
+        try:
+            fresh = get_atack_pods()
+        except Exception:
+            dlog.exception("pods_poller failed:")
+            time.sleep(poll_s)
+            continue
         fresh_names = set(p["name"] for p in fresh)
 
         for name in prev_names - fresh_names:
@@ -610,7 +629,12 @@ def cd_status_poller(state, poll_s, linger_s):
 
     while True:
         now = time.monotonic()
-        cd_status = get_cd_status()
+        try:
+            cd_status = get_cd_status()
+        except Exception:
+            dlog.exception("cd_status_poller failed:")
+            time.sleep(poll_s)
+            continue
         fresh_names = set(n["name"] for n in cd_status["nodes"])
 
         for nname in prev_node_names - fresh_names:
@@ -878,12 +902,29 @@ def main():
                 time.sleep(1.0 / REFRESH_HZ)
 
         except KeyboardInterrupt:
-            pass
+            dlog.warning("interrupted by user (Ctrl+C)")
+        except Exception:
+            dlog.exception("main loop crashed:")
         finally:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+            # Always restore terminal and clean up, regardless of exit path.
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+            except Exception:
+                pass
             for proc in followers.values():
-                proc.kill()
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    # Print final status to stdout (visible after TUI exits).
+    dlog.warning("dashboard exiting")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # Last resort — if main() itself throws before the Live context.
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
