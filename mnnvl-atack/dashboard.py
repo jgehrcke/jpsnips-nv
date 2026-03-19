@@ -44,6 +44,8 @@ _log_handler.stream.reconfigure(line_buffering=True)
 dlog = logging.getLogger("dashboard")
 dlog.setLevel(logging.INFO)
 dlog.addHandler(_log_handler)
+dlog.propagate = False  # Don't propagate to root logger — prevents
+                        # Rich Live deadlock from concurrent console writes.
 print(f"dashboard log: {_dashboard_log_path}", file=sys.stderr)
 import tty
 
