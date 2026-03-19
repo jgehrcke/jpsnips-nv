@@ -195,13 +195,18 @@ RETIRED_CHUNKS = []  # [(gpu_idx, va_ptr, alloc_size, alloc_handle, retire_time)
 HELD_REMOTE_LOCKS = set()
 
 
+_cuda_cleanup_done = False
+
 def cuda_cleanup():
     """Release all CUDA resources (shared chunks, verify buffers, contexts).
 
-    Registered via atexit so that graceful exits (SIGTERM, SIGINT, normal
-    return) clean up properly. SIGKILL cannot be caught — in that case the
-    CUDA driver handles cleanup at process teardown.
+    Called explicitly during graceful shutdown and registered via atexit as
+    a safety net. Idempotent — second call is a no-op.
     """
+    global _cuda_cleanup_done
+    if _cuda_cleanup_done:
+        return
+    _cuda_cleanup_done = True
     t0 = time.monotonic()
     log.info("cuda_cleanup: releasing GPU resources")
 
@@ -296,7 +301,10 @@ def main():
 
     log_imex_state()
     cuda_init()
-    atexit.register(cuda_cleanup)
+    def _atexit_handler():
+        cuda_cleanup()
+        log.info("atexit handler complete")
+    atexit.register(_atexit_handler)
     log_device_properties()
     prepare_all_shared_chunks()
 
@@ -336,6 +344,9 @@ def main():
     _broadcast_evict_to_peers()
     # 4. The poll thread checks SHUTTING_DOWN and finishes its current
     #    benchmark before exiting (daemon thread, will die with process).
+    # 5. Release CUDA resources (contexts, allocations). The atexit
+    #    handler is a safety net if we crash before reaching this point.
+    cuda_cleanup()
     log.info("graceful shutdown complete, proceeding to exit")
 
     # Schedule a hard kill if atexit cleanup hangs (e.g., CUDA driver
