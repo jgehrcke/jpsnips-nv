@@ -8,8 +8,11 @@ different nodes. Uses CU_MEM_HANDLE_TYPE_FABRIC handles exported via
 IMEX for cross-node GPU memory access.
 
 Each pod:
-  - Pre-allocates GPU memory and exports fabric handles once at startup.
-  - Serves pre-exported handles via HTTP (GET /prepare-chunk?gpu_index=N).
+  - Allocates and fills GPU memory once at startup per GPU.
+  - On each HTTP request (GET /prepare-chunk?gpu_index=N), re-exports a
+    fresh CU_MEM_HANDLE_TYPE_FABRIC handle via cuMemExportToShareableHandle.
+    Re-exporting per request (rather than caching) may surface stale IMEX
+    daemon state early.
   - Periodically benchmarks every (remote_gpu, local_gpu) pair across
     all peer pods: copies data from the remote GPU to the local GPU
     via cuMemcpyDtoD (device-to-device), timed with CUDA events.
@@ -20,7 +23,7 @@ Transfer duration is measured on-GPU via cuEventRecord before and after
 cuMemcpyDtoD, and cuEventElapsedTime to compute the interval. This
 excludes host-side overhead and reflects pure NVLink transfer time.
 
-Recommended chunk size is ~4000 MiB. Larger allocations (e.g. 10 GB)
+Recommended chunk size is 1000–4000 MiB. Larger allocations (e.g. 10 GB)
 fail silently during cuMemcpyDtoD — likely a CUDA driver limitation
 on the maximum size of a single fabric-handle-backed allocation or
 transfer. At NVLink 5 speeds (~820 GB/s net unidirectional), a 4 GB
@@ -98,12 +101,13 @@ GRANULARITIES = {}       # {gpu_idx: int}
 CHECKSUM_KERNELS = {}    # {gpu_idx: CUfunction}
 CHECKSUM_NUM_BLOCKS = {} # {gpu_idx: int}
 
-# Pre-computed chunk metadata per GPU (JSON bytes), set once during startup.
-# Each GPU gets its own chunk allocated, filled, and exported at init time.
-# The HTTP handler serves these on GET /prepare-chunk?gpu_index=N — no
-# per-request GPU work. Each peer's cuMemcpyDtoD still transfers the full
-# data over NVLink every time (the handle is just an address reference).
-SHARED_CHUNK_METAS = {}  # {gpu_idx: bytes (JSON)}
+# Per-GPU allocation handles and static metadata, set once during startup.
+# The allocation and fill happen once; the fabric handle is re-exported
+# fresh on each HTTP request via cuMemExportToShareableHandle. This may
+# help detect stale IMEX daemon state early.
+SHARED_CHUNK_ALLOC_HANDLES = {}  # {gpu_idx: CUmemGenericAllocationHandle}
+SHARED_CHUNK_STATIC_META = {}    # {gpu_idx: dict (without handle field)}
+LAST_EXPORTED_HANDLE_BYTES = {}  # {gpu_idx: bytes} — for detecting identical re-exports
 
 # Pre-allocated GPU buffers for verify_chunk_on_gpu(), per GPU.
 # Eliminates per-round cuMemAlloc/cuMemFree churn which may contribute to
@@ -535,7 +539,8 @@ def start_gpu_lock_watchdog():
 def prepare_all_shared_chunks():
     """Allocate, fill, and export a fabric handle on each local GPU.
 
-    Called once at startup. Populates SHARED_CHUNK_METAS.
+    Called once at startup. Populates SHARED_CHUNK_ALLOC_HANDLES and
+    SHARED_CHUNK_STATIC_META.
 
     Raises:
         CudaError: On any GPU allocation, fill, or export failure.
@@ -547,12 +552,13 @@ def prepare_all_shared_chunks():
 
 
 def _prepare_shared_chunk_for_gpu(gpu_idx):
-    """Allocate, fill, and export a fabric handle for one GPU.
+    """Allocate and fill GPU memory for one GPU. Does not export a handle —
+    that happens per HTTP request in export_fabric_handle_for_gpu().
 
     Precondition: the GPU's CUDA context must be pushed.
 
     Raises:
-        CudaError: On allocation, memset, or handle export failure.
+        CudaError: On allocation or memset failure.
     """
     chunk_bytes = CHUNK_MIB * 1024 * 1024
     granularity = GRANULARITIES[gpu_idx]
@@ -576,34 +582,61 @@ def _prepare_shared_chunk_for_gpu(gpu_idx):
     # float32's bit pattern via struct pack/unpack.
     float_as_uint32 = struct.unpack("I", struct.pack("f", FLOAT_VALUE))[0]
     checkCudaErrors(driver.cuMemsetD32(va_ptr, float_as_uint32, num_floats))
-    # cuMemsetD32 is asynchronous — wait for completion before exporting.
+    # cuMemsetD32 is asynchronous — wait for completion.
     checkCudaErrors(driver.cuCtxSynchronize())
 
     # Track for cleanup on exit.
     SHARED_CHUNK_ALLOCS[gpu_idx] = (va_ptr, alloc_size, alloc_handle)
-
-    fabric_handle = checkCudaErrors(
-        driver.cuMemExportToShareableHandle(
-            alloc_handle,
-            driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
-            0,
-        )
-    )
-
-    handle_b64 = base64.urlsafe_b64encode(fabric_handle.data).decode("ascii")
-
-    SHARED_CHUNK_METAS[gpu_idx] = json.dumps({
-        "handle": handle_b64,
+    SHARED_CHUNK_ALLOC_HANDLES[gpu_idx] = alloc_handle
+    SHARED_CHUNK_STATIC_META[gpu_idx] = {
         "pod_name": K8S_PODNAME,
         "node_name": K8S_NODENAME,
         "gpu_index": gpu_idx,
         "num_floats": num_floats,
         "float_value": FLOAT_VALUE,
         "alloc_size": alloc_size,
-    }).encode("utf-8")
+    }
 
     log.info("GPU %d: prepared shared chunk: %d MiB, %d floats",
              gpu_idx, alloc_size // (1024 * 1024), num_floats)
+
+
+def export_fabric_handle_for_gpu(gpu_idx) -> bytes:
+    """Export a fresh CU_MEM_HANDLE_TYPE_FABRIC handle and return the
+    complete chunk metadata as JSON bytes.
+
+    Called on every /prepare-chunk request. Re-exporting the handle each
+    time (rather than caching it) may help detect stale IMEX daemon state.
+    Logs a warning if the export takes longer than 10 ms.
+
+    Precondition: the GPU's CUDA context must be pushed.
+
+    Raises:
+        CudaError: If cuMemExportToShareableHandle fails.
+    """
+    t0 = time.monotonic()
+    fabric_handle = checkCudaErrors(
+        driver.cuMemExportToShareableHandle(
+            SHARED_CHUNK_ALLOC_HANDLES[gpu_idx],
+            driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+            0,
+        )
+    )
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    if elapsed_ms > 10:
+        log.warning("cuMemExportToShareableHandle for GPU %d took %.1f ms",
+                    gpu_idx, elapsed_ms)
+
+    handle_bytes = bytes(fabric_handle.data)
+    prev = LAST_EXPORTED_HANDLE_BYTES.get(gpu_idx)
+    if prev is not None and handle_bytes == prev:
+        log.info("GPU %d: re-exported handle is identical to previous", gpu_idx)
+    LAST_EXPORTED_HANDLE_BYTES[gpu_idx] = handle_bytes
+
+    handle_b64 = base64.urlsafe_b64encode(handle_bytes).decode("ascii")
+    meta = dict(SHARED_CHUNK_STATIC_META[gpu_idx])
+    meta["handle"] = handle_b64
+    return json.dumps(meta).encode("utf-8")
 
 
 def fetch_chunk_meta(peer_host: str, port: int, gpu_index: int) -> dict:
@@ -1030,14 +1063,24 @@ class HTTPHandler(BaseHTTPRequestHandler):
             return
         _, _, gpu_idx = result
 
-        if gpu_idx not in SHARED_CHUNK_METAS:
+        if gpu_idx not in SHARED_CHUNK_ALLOC_HANDLES:
             self._respond(404, f"no chunk for gpu_index={gpu_idx}")
             return
+
+        ensure_cuda_context(gpu_idx)
+        try:
+            body = export_fabric_handle_for_gpu(gpu_idx)
+        except CudaError as exc:
+            pop_cuda_context()
+            log.exception("export fabric handle for GPU %d failed:", gpu_idx)
+            self._respond(500, str(exc))
+            return
+        pop_cuda_context()
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(SHARED_CHUNK_METAS[gpu_idx])
+        self.wfile.write(body)
 
     def do_POST(self):
         result = self._parse_gpu_index()
