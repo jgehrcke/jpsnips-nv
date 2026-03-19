@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["rich"]
+# dependencies = ["rich", "requests"]
 # ///
 """
 TUI dashboard for atack — All-to-All CUDA Kubernetes test.
@@ -23,6 +23,8 @@ import re
 import select
 import subprocess
 import sys
+
+import requests as requests_lib  # Avoid shadowing with local vars.
 import termios
 import threading
 import time
@@ -106,10 +108,28 @@ def get_atack_pods():
         name = item["metadata"]["name"]
         idx = name.rsplit("-", 1)[1]
         node = item["spec"].get("nodeName", "?")
+        created = item["metadata"].get("creationTimestamp", "")
+        age = ""
+        if created:
+            try:
+                ct = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+                delta = datetime.datetime.now(datetime.timezone.utc) - ct
+                secs = int(delta.total_seconds())
+                if secs < 60:
+                    age = f"{secs}s"
+                elif secs < 3600:
+                    age = f"{secs // 60}m{secs % 60}s"
+                else:
+                    age = f"{secs // 3600}h{(secs % 3600) // 60}m"
+            except Exception:
+                age = "?"
         phase = item["status"].get("phase", "?")
         cstatuses = item["status"].get("containerStatuses", [])
+        liveness_failing = False
+        restart_count = 0
         if cstatuses:
             cs = cstatuses[0]
+            restart_count = cs.get("restartCount", 0)
             if cs.get("ready"):
                 status = "Ready"
             elif cs.get("state", {}).get("waiting"):
@@ -118,9 +138,37 @@ def get_atack_pods():
                 status = phase
         else:
             status = phase
-        ip = item["status"].get("podIP", "?")
-        pods.append({"name": name, "idx": idx, "node": node,
-                      "status": status, "ip": ip})
+
+        # Detect liveness probe failure from pod conditions.
+        for cond in item["status"].get("conditions", []):
+            if cond.get("type") == "ContainersReady" and cond.get("status") == "False":
+                reason = cond.get("reason", "")
+                if reason:
+                    liveness_failing = True
+
+        # Also check if container was recently killed by liveness probe.
+        if cstatuses:
+            last_state = cstatuses[0].get("lastState", {})
+            terminated = last_state.get("terminated", {})
+            if terminated.get("reason") == "OOMKilled" or (
+                    terminated.get("exitCode", 0) != 0 and restart_count > 0):
+                liveness_failing = True
+
+        # Probe /healthz to detect CUDA_ERROR_ILLEGAL_STATE.
+        cuda_fatal = ""
+        pod_ip = item["status"].get("podIP")
+        if pod_ip and status == "Ready":
+            try:
+                resp = requests_lib.get(f"http://{pod_ip}:1337/healthz", timeout=(0.5, 1))
+                if resp.status_code == 500 and "ILLEGAL_STATE" in resp.text:
+                    cuda_fatal = resp.text
+                    liveness_failing = True
+            except Exception:
+                pass
+
+        pods.append({"name": name, "idx": idx, "node": node, "age": age,
+                      "status": status, "liveness_failing": liveness_failing,
+                      "restart_count": restart_count, "cuda_fatal": cuda_fatal})
     return sorted(pods, key=lambda p: p["node"])
 
 
@@ -274,15 +322,25 @@ def build_pods_table(atack_pods):
     table.add_column("#", style="bold", width=3)
     table.add_column("Pod")
     table.add_column("Node")
+    table.add_column("Age")
     table.add_column("Status")
+    table.add_column("Liveness")
+    table.add_column("CUDA Fatal")
 
     for p in atack_pods:
         color = status_color(p["status"])
-        table.add_row(p["idx"], p["name"], p["node"],
-                      Text(p["status"], style=color))
+        liveness = ""
+        if p.get("liveness_failing"):
+            liveness = Text("FAILING", style="red bold")
+        cuda_fatal = ""
+        if p.get("cuda_fatal"):
+            cuda_fatal = Text("ILLEGAL_STATE", style="red bold")
+        table.add_row(p["idx"], p["name"], p["node"], p.get("age", ""),
+                      Text(p["status"], style=color),
+                      liveness, cuda_fatal)
 
     if not atack_pods:
-        table.add_row("—", "no pods", "", "")
+        table.add_row("—", "no pods", "", "", "", "", "")
 
     return Panel(table, title="Workload Pods", title_align="left",
                  border_style="blue", padding=(0, 1))

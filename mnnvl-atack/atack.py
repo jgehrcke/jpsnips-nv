@@ -90,6 +90,13 @@ VERIFY_LOCAL_BUFS = {}       # {gpu_idx: CUdeviceptr}
 VERIFY_LOCAL_BUF_SIZES = {}  # {gpu_idx: int}
 VERIFY_PARTIALS_BUFS = {}    # {gpu_idx: CUdeviceptr}
 
+# Fatal CUDA error tracking. When set, the /healthz endpoint returns 500
+# to fail the liveness probe, causing kubelet to replace the pod (not just
+# restart the container). A new pod triggers fresh IMEX daemon resource
+# claims. This is specifically for CUDA_ERROR_ILLEGAL_STATE which indicates
+# unrecoverable GPU state corruption.
+FATAL_CUDA_ERROR = None  # Set to error string on fatal error
+
 # Shared chunk allocations tracked for cleanup on exit.
 # {gpu_idx: (va_ptr, alloc_size, alloc_handle)}
 SHARED_CHUNK_ALLOCS = {}
@@ -988,7 +995,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if "/healthz" in self.path:
-            self._respond(200, b"ok")
+            if FATAL_CUDA_ERROR:
+                self._respond(500, f"fatal: {FATAL_CUDA_ERROR}")
+            else:
+                self._respond(200, b"ok")
             return
 
         if "/prepare-chunk" not in self.path:
@@ -1150,12 +1160,21 @@ def checkCudaErrors(result):
     returns the payload (single value or tuple of values), or None if
     the result contains only the status code.
     """
+    global FATAL_CUDA_ERROR
     if result[0].value:
-        raise CudaError(
-            "CUDA error code={}({})".format(
-                result[0].value, _cudaGetErrorEnum(result[0])
-            )
-        )
+        error_name = _cudaGetErrorEnum(result[0])
+        error_msg = "CUDA error code={}({})".format(result[0].value, error_name)
+
+        # CUDA_ERROR_ILLEGAL_STATE (code 401) indicates unrecoverable GPU
+        # state corruption. Flag it so /healthz fails the liveness probe,
+        # causing kubelet to replace this pod with a fresh one (new IMEX
+        # daemon resource claims).
+        if result[0] == driver.CUresult.CUDA_ERROR_ILLEGAL_STATE:
+            FATAL_CUDA_ERROR = error_msg
+            log.error("FATAL: %s — liveness probe will fail, pod will be replaced",
+                      error_msg)
+
+        raise CudaError(error_msg)
     if len(result) == 1:
         return None
     elif len(result) == 2:
