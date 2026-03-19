@@ -153,12 +153,12 @@ FATAL_CUDA_ERROR = None  # Set to error string on fatal error
 # {gpu_idx: (va_ptr, alloc_size, alloc_handle)}
 SHARED_CHUNK_ALLOCS = {}
 
-# Previous chunk allocations kept alive for one refresh cycle. A remote pod
-# may have imported the old fabric handle and could still be doing a DtoD
-# copy from it. Freeing immediately would cause CUDA_ERROR_INVALID_HANDLE.
-# The old allocation is freed at the *next* refresh, by which time any
-# in-flight transfer has long completed (DtoD takes ~5ms, refresh is 30s).
-PREV_CHUNK_ALLOCS = {}  # {gpu_idx: (va_ptr, alloc_size, alloc_handle)}
+# Retired chunk allocations kept alive before freeing. A remote pod may have
+# imported an old fabric handle and could still be doing a DtoD copy from it.
+# Freeing immediately would cause CUDA_ERROR_INVALID_HANDLE or SIGSEGV.
+# Chunks are freed only after CHUNK_RETIRE_S seconds (3 refresh cycles).
+CHUNK_RETIRE_S = CHUNK_REFRESH_INTERVAL_S * 3
+RETIRED_CHUNKS = []  # [(gpu_idx, va_ptr, alloc_size, alloc_handle, retire_time)]
 
 # Track currently held remote GPU locks for best-effort release on exit.
 # Set of (peer_host, port, gpu_index, token).
@@ -188,20 +188,29 @@ def cuda_cleanup():
                         peer_host, gpu_index)
     HELD_REMOTE_LOCKS.clear()
 
-    for allocs_dict in [SHARED_CHUNK_ALLOCS, PREV_CHUNK_ALLOCS]:
-        for gpu_idx in list(allocs_dict.keys()):
-            entry = allocs_dict[gpu_idx]
-            if entry is None:
-                continue
-            va_ptr, alloc_size, alloc_handle = entry
-            try:
-                ensure_cuda_context(gpu_idx)
-                driver.cuMemUnmap(va_ptr, alloc_size)
-                driver.cuMemRelease(alloc_handle)
-                driver.cuMemAddressFree(va_ptr, alloc_size)
-                pop_cuda_context()
-            except Exception as exc:
-                log.warning("cuda_cleanup: GPU %d shared chunk: %s", gpu_idx, exc)
+    for gpu_idx in list(SHARED_CHUNK_ALLOCS.keys()):
+        entry = SHARED_CHUNK_ALLOCS[gpu_idx]
+        if entry is None:
+            continue
+        va_ptr, alloc_size, alloc_handle = entry
+        try:
+            ensure_cuda_context(gpu_idx)
+            driver.cuMemUnmap(va_ptr, alloc_size)
+            driver.cuMemRelease(alloc_handle)
+            driver.cuMemAddressFree(va_ptr, alloc_size)
+            pop_cuda_context()
+        except Exception as exc:
+            log.warning("cuda_cleanup: GPU %d shared chunk: %s", gpu_idx, exc)
+
+    for r_gpu, va_ptr, alloc_size, alloc_handle, _ in RETIRED_CHUNKS:
+        try:
+            ensure_cuda_context(r_gpu)
+            driver.cuMemUnmap(va_ptr, alloc_size)
+            driver.cuMemRelease(alloc_handle)
+            driver.cuMemAddressFree(va_ptr, alloc_size)
+            pop_cuda_context()
+        except Exception as exc:
+            log.warning("cuda_cleanup: GPU %d retired chunk: %s", r_gpu, exc)
 
     for gpu_idx in list(VERIFY_LOCAL_BUFS.keys()):
         try:
@@ -611,13 +620,40 @@ def prepare_all_shared_chunks():
 
 
 
+def _free_retired_chunks(gpu_idx):
+    """Free chunks that have been retired for longer than CHUNK_RETIRE_S.
+
+    Precondition: the GPU's CUDA context must be pushed.
+    """
+    now = time.monotonic()
+    remaining = []
+    for entry in RETIRED_CHUNKS:
+        r_gpu, va_ptr, alloc_size, alloc_handle, retire_time = entry
+        if r_gpu != gpu_idx:
+            remaining.append(entry)
+            continue
+        if now - retire_time < CHUNK_RETIRE_S:
+            remaining.append(entry)
+            continue
+        try:
+            driver.cuMemUnmap(va_ptr, alloc_size)
+            driver.cuMemRelease(alloc_handle)
+            driver.cuMemAddressFree(va_ptr, alloc_size)
+            log.info("GPU %d: freed retired chunk (age %.0fs)",
+                     gpu_idx, now - retire_time)
+        except Exception:
+            log.warning("GPU %d: failed to free retired chunk (ignored)",
+                        gpu_idx)
+    RETIRED_CHUNKS[:] = remaining
+
+
 def _refresh_shared_chunk_for_gpu(gpu_idx):
     """Replace the shared chunk on one GPU with a fresh allocation.
 
-    The old allocation is not freed immediately — it's kept in
-    PREV_CHUNK_ALLOCS and freed on the *next* refresh cycle. This
-    prevents CUDA_ERROR_INVALID_HANDLE for remote pods that imported
-    the old fabric handle and may still be doing a DtoD copy from it.
+    The old allocation is retired and freed only after CHUNK_RETIRE_S
+    seconds (~3 refresh cycles). This prevents SIGSEGV / INVALID_HANDLE
+    for remote pods that imported the old fabric handle and may still
+    be mid-DtoD.
 
     Acquires the GPU lock to prevent benchmarks from reading during the
     swap. The lock hold time is ~1-2 ms (allocate + fill + sync).
@@ -627,21 +663,16 @@ def _refresh_shared_chunk_for_gpu(gpu_idx):
     Raises:
         CudaError: On allocation or memset failure.
     """
-    # Free the allocation from the *previous* refresh cycle (two cycles old).
-    prev = PREV_CHUNK_ALLOCS.pop(gpu_idx, None)
-    if prev is not None:
-        va_ptr, alloc_size, alloc_handle = prev
-        try:
-            driver.cuMemUnmap(va_ptr, alloc_size)
-            driver.cuMemRelease(alloc_handle)
-            driver.cuMemAddressFree(va_ptr, alloc_size)
-        except Exception:
-            log.warning("failed to free previous chunk on GPU %d (ignored)", gpu_idx)
+    _free_retired_chunks(gpu_idx)
 
-    # Stash the current allocation, allocate a new one under the lock.
+    # Retire the current allocation, allocate a new one under the lock.
     acquire_local_gpu_lock(gpu_idx)
     try:
-        PREV_CHUNK_ALLOCS[gpu_idx] = SHARED_CHUNK_ALLOCS.get(gpu_idx)
+        old = SHARED_CHUNK_ALLOCS.get(gpu_idx)
+        if old is not None:
+            RETIRED_CHUNKS.append(
+                (gpu_idx, old[0], old[1], old[2], time.monotonic()))
+            log.info("GPU %d: retired old chunk", gpu_idx)
         _prepare_shared_chunk_for_gpu(gpu_idx)
     finally:
         release_local_gpu_lock(gpu_idx)
