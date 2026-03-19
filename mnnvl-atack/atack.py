@@ -316,14 +316,16 @@ def pop_cuda_context():
     checkCudaErrors(driver.cuCtxPopCurrent())
 
 
-def acquire_local_gpu_lock(gpu_idx):
-    """Acquire the local GPU lock, blocking until available."""
-    log.info("local lock GPU %d: acquiring", gpu_idx)
+def acquire_local_gpu_lock(gpu_idx) -> float:
+    """Acquire the local GPU lock, blocking until available.
+    Returns the acquisition wait time in milliseconds."""
+    log.debug("local lock GPU %d: acquiring", gpu_idx)
     t0 = time.monotonic()
     GPU_LOCKS[gpu_idx].acquire()
     GPU_LOCK_TIMESTAMPS[gpu_idx] = time.monotonic()
-    log.info("local lock GPU %d: acquired in %.1f ms", gpu_idx,
-              (time.monotonic() - t0) * 1000)
+    wait_ms = (time.monotonic() - t0) * 1000
+    log.debug("local lock GPU %d: acquired in %.1f ms", gpu_idx, wait_ms)
+    return wait_ms
 
 
 def release_local_gpu_lock(gpu_idx):
@@ -334,11 +336,10 @@ def release_local_gpu_lock(gpu_idx):
         pass  # Already released (e.g. by timeout watchdog).
 
 
-def acquire_remote_gpu_lock(peer_host: str, port: int, gpu_index: int) -> str:
+def acquire_remote_gpu_lock(peer_host: str, port: int, gpu_index: int) -> tuple[str, float]:
     """Acquire a GPU lock on a remote pod via HTTP. Blocks until the lock is
-    granted or times out. Returns a token that must be passed to
-    release_remote_gpu_lock."""
-    log.info("remote lock %s GPU %d: acquiring", peer_host, gpu_index)
+    granted or times out. Returns (token, wait_ms)."""
+    log.debug("remote lock %s GPU %d: acquiring", peer_host, gpu_index)
     t0 = time.monotonic()
     resp = requests.post(
         f"http://{peer_host}:{port}/lock-gpu?gpu_index={gpu_index}",
@@ -346,9 +347,10 @@ def acquire_remote_gpu_lock(peer_host: str, port: int, gpu_index: int) -> str:
     )
     if resp.status_code != 200:
         raise RuntimeError(f"lock-gpu failed: HTTP {resp.status_code}: {resp.text}")
-    log.info("remote lock %s GPU %d: acquired in %.1f ms",
-              peer_host, gpu_index, (time.monotonic() - t0) * 1000)
-    return resp.text
+    wait_ms = (time.monotonic() - t0) * 1000
+    log.debug("remote lock %s GPU %d: acquired in %.1f ms",
+              peer_host, gpu_index, wait_ms)
+    return (resp.text, wait_ms)
 
 
 def release_remote_gpu_lock(peer_host: str, port: int, gpu_index: int,
@@ -591,7 +593,7 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
         meta = fetch_chunk_meta(peer_host, port, remote_gpu_idx)
     except Exception:
         log.exception("failed to fetch chunk meta from %s gpu %d:", peer_name, remote_gpu_idx)
-        return ("req-err", "?")
+        return ("req-err", "?", 0.0, 0.0)
 
     peer_node = meta.get("node_name", "?")
     alloc_size = meta["alloc_size"]
@@ -600,6 +602,7 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
     imported_handle = None
     va_ptr = None
     result = "OK"
+    benchmark_ms = 0.0
 
     ensure_cuda_context(local_gpu_idx)
     try:
@@ -624,33 +627,36 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
         remote_key = (peer_idx_int, remote_gpu_idx)
 
         remote_token = None
+        lock_wait_ms = 0.0
         if local_key < remote_key:
             # Local lock first.
-            acquire_local_gpu_lock(local_gpu_idx)
+            local_wait = acquire_local_gpu_lock(local_gpu_idx)
             try:
-                remote_token = acquire_remote_gpu_lock(peer_host, port, remote_gpu_idx)
+                remote_token, remote_wait = acquire_remote_gpu_lock(peer_host, port, remote_gpu_idx)
             except Exception:
                 release_local_gpu_lock(local_gpu_idx)
                 log.exception("failed to acquire remote GPU lock on %s gpu %d:",
                               peer_name, remote_gpu_idx)
-                return ("lock-err", peer_node)
+                return ("lock-err", peer_node, 0.0, 0.0)
+            lock_wait_ms = max(local_wait, remote_wait)
         else:
             # Remote lock first.
             try:
-                remote_token = acquire_remote_gpu_lock(peer_host, port, remote_gpu_idx)
+                remote_token, remote_wait = acquire_remote_gpu_lock(peer_host, port, remote_gpu_idx)
             except Exception:
                 log.exception("failed to acquire remote GPU lock on %s gpu %d:",
                               peer_name, remote_gpu_idx)
-                return ("lock-err", peer_node)
-            acquire_local_gpu_lock(local_gpu_idx)
+                return ("lock-err", peer_node, 0.0, 0.0)
+            local_wait = acquire_local_gpu_lock(local_gpu_idx)
+            lock_wait_ms = max(local_wait, remote_wait)
 
         try:
-            result, elapsed_ms = verify_chunk_on_gpu(
+            result, benchmark_ms = verify_chunk_on_gpu(
                 local_gpu_idx, va_ptr, alloc_size,
                 meta["num_floats"], meta["float_value"])
-            log.info("benchmark done %s-g%d -> local-g%d: %.1f ms, %s",
-                     peer_name, remote_gpu_idx, local_gpu_idx,
-                     elapsed_ms, result)
+            log.debug("benchmark done %s-g%d -> local-g%d: %.1f ms, %s",
+                      peer_name, remote_gpu_idx, local_gpu_idx,
+                      benchmark_ms, result)
         finally:
             release_local_gpu_lock(local_gpu_idx)
             release_remote_gpu_lock(peer_host, port, remote_gpu_idx, remote_token)
@@ -670,7 +676,7 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
             log.exception("cleanup error for chunk from %s:", peer_name)
         pop_cuda_context()
 
-    return (result, peer_node)
+    return (result, peer_node, lock_wait_ms, benchmark_ms)
 
 
 def discover_peers() -> list[tuple[str, str]]:
@@ -738,18 +744,30 @@ def peer_poll_loop():
             random.shuffle(work_items)
 
             my_idx = K8S_PODNAME.rsplit("-", 1)[1]
+            max_lock_wait_ms = 0.0
+            benchmark_durations = []
             for pod_name, peer_host, remote_gpu_idx, local_gpu_idx in work_items:
                 peer_idx = pod_name.rsplit("-", 1)[1]
-                log.info("benchmark %s-g%d -> local-g%d",
-                         pod_name, remote_gpu_idx, local_gpu_idx)
-                status, peer_node = import_and_verify_chunk(
+                log.debug("benchmark %s-g%d -> local-g%d",
+                          pod_name, remote_gpu_idx, local_gpu_idx)
+                status, peer_node, lock_wait, bench_ms = import_and_verify_chunk(
                     pod_name, peer_host, HTTPD_PORT,
                     remote_gpu_idx, local_gpu_idx)
+                max_lock_wait_ms = max(max_lock_wait_ms, lock_wait)
+                if bench_ms > 0:
+                    benchmark_durations.append(bench_ms)
                 peer_node_for_idx[peer_idx] = peer_node
                 key = f"{peer_idx}@{peer_node}-g{remote_gpu_idx}-g{local_gpu_idx}"
                 results[key] = status
 
             round_dur = time.monotonic() - round_t0
+            if benchmark_durations:
+                bmin = min(benchmark_durations)
+                bmax = max(benchmark_durations)
+                bmean = sum(benchmark_durations) / len(benchmark_durations)
+                log.info("round stats: DtoD min=%.1f max=%.1f mean=%.1f ms, "
+                         "max_lock_wait=%.1f ms",
+                         bmin, bmax, bmean, max_lock_wait_ms)
             parts = []
             for key, status in sorted(results.items()):
                 parts.append(f"{key}:{status}")
@@ -854,13 +872,13 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
         if "/lock-gpu" in parsed.path:
             # Block until the lock is available.
-            log.info("HTTPD lock-gpu %d: request from %s, waiting",
+            log.debug("HTTPD lock-gpu %d: request from %s, waiting",
                       gpu_idx, self.client_address[0])
             t0 = time.monotonic()
             acquired = GPU_LOCKS[gpu_idx].acquire(timeout=GPU_LOCK_TIMEOUT_S)
             wait_ms = (time.monotonic() - t0) * 1000
             if acquired:
-                log.info("HTTPD lock-gpu %d: granted to %s after %.1f ms",
+                log.debug("HTTPD lock-gpu %d: granted to %s after %.1f ms",
                           gpu_idx, self.client_address[0], wait_ms)
                 token = uuid.uuid4().hex[:12]
                 GPU_LOCK_TOKENS[gpu_idx] = token
