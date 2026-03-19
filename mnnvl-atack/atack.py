@@ -582,101 +582,100 @@ def unmap_imported_chunk(va_ptr, alloc_size: int, alloc_handle):
         checkCudaErrors(driver.cuMemRelease(alloc_handle))
 
 
-def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
-                            remote_gpu_idx: int, local_gpu_idx: int) -> tuple[str, str]:
-    """Request a chunk from a specific remote GPU, import it on a specific local
-    GPU, and verify contents.
+def acquire_gpu_lock_pair(peer_name, peer_host, port, remote_gpu_idx,
+                          local_gpu_idx):
+    """Acquire locks on both remote source GPU and local destination GPU.
 
-    Returns (result_str, peer_node_name). result_str is a bandwidth like
-    '818.3 GB/s' on success, or an error string.
+    Uses consistent global ordering by (pod_idx, gpu_idx) to avoid deadlock.
+    May raise RuntimeError if the remote lock cannot be acquired.
+    Returns (remote_token, lock_wait_ms).
+    """
+    my_idx = int(K8S_PODNAME.rsplit("-", 1)[1])
+    peer_idx_int = int(peer_name.rsplit("-", 1)[1])
+    local_key = (my_idx, local_gpu_idx)
+    remote_key = (peer_idx_int, remote_gpu_idx)
+
+    if local_key < remote_key:
+        local_wait = acquire_local_gpu_lock(local_gpu_idx)
+        try:
+            remote_token, remote_wait = acquire_remote_gpu_lock(
+                peer_host, port, remote_gpu_idx)
+        except Exception:
+            release_local_gpu_lock(local_gpu_idx)
+            raise
+    else:
+        remote_token, remote_wait = acquire_remote_gpu_lock(
+            peer_host, port, remote_gpu_idx)
+        local_wait = acquire_local_gpu_lock(local_gpu_idx)
+
+    return remote_token, max(local_wait, remote_wait)
+
+
+def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
+                          handle_bytes, alloc_size, num_floats, float_value):
+    """Import a fabric handle, map it, run the locked benchmark, clean up.
+
+    Manages CUDA context push/pop and lock acquire/release internally.
+    May raise CudaError or RuntimeError.
+    Returns (result_str, lock_wait_ms, benchmark_ms).
+    """
+    peer_name = peer_host.split(".")[0]
+    ensure_cuda_context(local_gpu_idx)
+
+    imported_handle = import_fabric_handle(handle_bytes)
+    va_ptr = map_imported_chunk(imported_handle, alloc_size, local_gpu_idx)
+
+    try:
+        remote_token, lock_wait_ms = acquire_gpu_lock_pair(
+            peer_name, peer_host, port, remote_gpu_idx, local_gpu_idx)
+        try:
+            result, benchmark_ms = verify_chunk_on_gpu(
+                local_gpu_idx, va_ptr, alloc_size, num_floats, float_value)
+        finally:
+            release_local_gpu_lock(local_gpu_idx)
+            release_remote_gpu_lock(peer_host, port, remote_gpu_idx,
+                                    remote_token)
+    finally:
+        unmap_imported_chunk(va_ptr, alloc_size, imported_handle)
+        pop_cuda_context()
+
+    return result, lock_wait_ms, benchmark_ms
+
+
+def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
+                            remote_gpu_idx: int,
+                            local_gpu_idx: int) -> tuple[str, str, float, float]:
+    """Request a chunk from a specific remote GPU, import it on a specific
+    local GPU, and verify contents.
+
+    Returns (result_str, peer_node_name, lock_wait_ms, benchmark_ms).
     """
     try:
         meta = fetch_chunk_meta(peer_host, port, remote_gpu_idx)
     except Exception:
-        log.exception("failed to fetch chunk meta from %s gpu %d:", peer_name, remote_gpu_idx)
+        log.exception("fetch chunk meta from %s gpu %d failed:",
+                      peer_name, remote_gpu_idx)
         return ("req-err", "?", 0.0, 0.0)
 
     peer_node = meta.get("node_name", "?")
-    alloc_size = meta["alloc_size"]
     handle_bytes = base64.urlsafe_b64decode(meta["handle"])
 
-    imported_handle = None
-    va_ptr = None
-    result = "OK"
-    benchmark_ms = 0.0
-
-    ensure_cuda_context(local_gpu_idx)
     try:
-        imported_handle = import_fabric_handle(handle_bytes)
-        va_ptr = map_imported_chunk(imported_handle, alloc_size, local_gpu_idx)
-
-        # Acquire locks on both the remote source GPU and the local
-        # destination GPU to ensure exclusive HBM access during the timed
-        # DtoD transfer and checksum. Only the actual benchmark is locked —
-        # import/map/unmap happen outside the critical section to minimize
-        # lock hold time.
-        #
-        # IMPORTANT: to avoid deadlock, always acquire locks in a consistent
-        # global order: (pod_idx, gpu_idx) ascending. Two pods could
-        # otherwise hold each other's locks in opposite order:
-        #   Pod 0 holds local GPU1, waits for remote Pod1-GPU0
-        #   Pod 1 holds local GPU0, waits for remote Pod0-GPU1
-        # This is a classic circular wait deadlock.
-        my_idx = int(K8S_PODNAME.rsplit("-", 1)[1])
-        peer_idx_int = int(peer_name.rsplit("-", 1)[1])
-        local_key = (my_idx, local_gpu_idx)
-        remote_key = (peer_idx_int, remote_gpu_idx)
-
-        remote_token = None
-        lock_wait_ms = 0.0
-        if local_key < remote_key:
-            # Local lock first.
-            local_wait = acquire_local_gpu_lock(local_gpu_idx)
-            try:
-                remote_token, remote_wait = acquire_remote_gpu_lock(peer_host, port, remote_gpu_idx)
-            except Exception:
-                release_local_gpu_lock(local_gpu_idx)
-                log.exception("failed to acquire remote GPU lock on %s gpu %d:",
-                              peer_name, remote_gpu_idx)
-                return ("lock-err", peer_node, 0.0, 0.0)
-            lock_wait_ms = max(local_wait, remote_wait)
-        else:
-            # Remote lock first.
-            try:
-                remote_token, remote_wait = acquire_remote_gpu_lock(peer_host, port, remote_gpu_idx)
-            except Exception:
-                log.exception("failed to acquire remote GPU lock on %s gpu %d:",
-                              peer_name, remote_gpu_idx)
-                return ("lock-err", peer_node, 0.0, 0.0)
-            local_wait = acquire_local_gpu_lock(local_gpu_idx)
-            lock_wait_ms = max(local_wait, remote_wait)
-
-        try:
-            result, benchmark_ms = verify_chunk_on_gpu(
-                local_gpu_idx, va_ptr, alloc_size,
-                meta["num_floats"], meta["float_value"])
-            log.debug("benchmark done %s-g%d -> local-g%d: %.1f ms, %s",
-                      peer_name, remote_gpu_idx, local_gpu_idx,
-                      benchmark_ms, result)
-        finally:
-            release_local_gpu_lock(local_gpu_idx)
-            release_remote_gpu_lock(peer_host, port, remote_gpu_idx, remote_token)
-
+        result, lock_wait_ms, benchmark_ms = import_map_and_verify(
+            peer_host, port, remote_gpu_idx, local_gpu_idx,
+            handle_bytes, meta["alloc_size"], meta["num_floats"],
+            meta["float_value"])
     except CudaError:
-        log.exception("CUDA error importing/verifying chunk from %s g%d→g%d:",
-                      peer_name, remote_gpu_idx, local_gpu_idx)
-        result = "cuda-err"
+        log.exception("CUDA error %s g%d→g%d:", peer_name, remote_gpu_idx,
+                      local_gpu_idx)
+        return ("cuda-err", peer_node, 0.0, 0.0)
     except Exception:
-        log.exception("unexpected error importing/verifying chunk from %s g%d→g%d:",
-                      peer_name, remote_gpu_idx, local_gpu_idx)
-        result = "err"
-    finally:
-        try:
-            unmap_imported_chunk(va_ptr, alloc_size, imported_handle)
-        except Exception:
-            log.exception("cleanup error for chunk from %s:", peer_name)
-        pop_cuda_context()
+        log.exception("error %s g%d→g%d:", peer_name, remote_gpu_idx,
+                      local_gpu_idx)
+        return ("err", peer_node, 0.0, 0.0)
 
+    log.debug("benchmark done %s-g%d -> local-g%d: %.1f ms, %s",
+              peer_name, remote_gpu_idx, local_gpu_idx, benchmark_ms, result)
     return (result, peer_node, lock_wait_ms, benchmark_ms)
 
 
@@ -804,41 +803,48 @@ def start_peer_poll_thread():
 # ---------------------------------------------------------------------------
 
 class HTTPHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if "/healthz" in self.path:
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-            return
 
-        if "/prepare-chunk" not in self.path:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"unknown path")
-            return
+    def _respond(self, code, body):
+        """Send a response with the given status code and body bytes."""
+        self.send_response(code)
+        self.end_headers()
+        if isinstance(body, str):
+            body = body.encode()
+        self.wfile.write(body)
 
-        # Parse gpu_index query parameter.
+    def _parse_gpu_index(self):
+        """Parse and validate gpu_index from query string. Returns
+        (parsed_url, params, gpu_idx) or sends an error response and
+        returns None."""
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         gpu_index_vals = params.get("gpu_index")
         if not gpu_index_vals:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b"missing gpu_index parameter")
-            return
-
+            self._respond(400, b"missing gpu_index parameter")
+            return None
         try:
             gpu_idx = int(gpu_index_vals[0])
         except ValueError:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b"invalid gpu_index")
+            self._respond(400, b"invalid gpu_index")
+            return None
+        return parsed, params, gpu_idx
+
+    def do_GET(self):
+        if "/healthz" in self.path:
+            self._respond(200, b"ok")
             return
 
+        if "/prepare-chunk" not in self.path:
+            self._respond(404, b"unknown path")
+            return
+
+        result = self._parse_gpu_index()
+        if result is None:
+            return
+        _, _, gpu_idx = result
+
         if gpu_idx not in SHARED_CHUNK_METAS:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(f"no chunk for gpu_index={gpu_idx}".encode())
+            self._respond(404, f"no chunk for gpu_index={gpu_idx}")
             return
 
         self.send_response(200)
@@ -847,80 +853,59 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(SHARED_CHUNK_METAS[gpu_idx])
 
     def do_POST(self):
-        parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
-
-        gpu_index_vals = params.get("gpu_index")
-        if not gpu_index_vals:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b"missing gpu_index parameter")
+        result = self._parse_gpu_index()
+        if result is None:
             return
-
-        try:
-            gpu_idx = int(gpu_index_vals[0])
-        except ValueError:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b"invalid gpu_index")
-            return
+        parsed, params, gpu_idx = result
 
         if gpu_idx not in GPU_LOCKS:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(f"no GPU {gpu_idx}".encode())
+            self._respond(404, f"no GPU {gpu_idx}")
             return
 
         if "/lock-gpu" in parsed.path:
-            # Block until the lock is available.
-            log.debug("HTTPD lock-gpu %d: request from %s, waiting",
-                      gpu_idx, self.client_address[0])
-            t0 = time.monotonic()
-            acquired = GPU_LOCKS[gpu_idx].acquire(timeout=GPU_LOCK_TIMEOUT_S)
-            wait_ms = (time.monotonic() - t0) * 1000
-            if acquired:
-                log.debug("HTTPD lock-gpu %d: granted to %s after %.1f ms",
-                          gpu_idx, self.client_address[0], wait_ms)
-                token = uuid.uuid4().hex[:12]
-                GPU_LOCK_TOKENS[gpu_idx] = token
-                GPU_LOCK_TIMESTAMPS[gpu_idx] = time.monotonic()
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(token.encode())
-            else:
-                self.send_response(503)
-                self.end_headers()
-                self.wfile.write(b"lock acquisition timed out")
+            self._handle_lock_gpu(gpu_idx)
+        elif "/unlock-gpu" in parsed.path:
+            self._handle_unlock_gpu(gpu_idx, params)
+        else:
+            self._respond(404, b"unknown path")
+
+    def _handle_lock_gpu(self, gpu_idx):
+        """Block until GPU lock is available, then return a token."""
+        log.debug("HTTPD lock-gpu %d: request from %s, waiting",
+                  gpu_idx, self.client_address[0])
+        t0 = time.monotonic()
+        acquired = GPU_LOCKS[gpu_idx].acquire(timeout=GPU_LOCK_TIMEOUT_S)
+        wait_ms = (time.monotonic() - t0) * 1000
+
+        if not acquired:
+            self._respond(503, b"lock acquisition timed out")
             return
 
-        if "/unlock-gpu" in parsed.path:
-            token_vals = params.get("token")
-            token = token_vals[0] if token_vals else None
-            current_token = GPU_LOCK_TOKENS.get(gpu_idx)
+        log.debug("HTTPD lock-gpu %d: granted to %s after %.1f ms",
+                  gpu_idx, self.client_address[0], wait_ms)
+        token = uuid.uuid4().hex[:12]
+        GPU_LOCK_TOKENS[gpu_idx] = token
+        GPU_LOCK_TIMESTAMPS[gpu_idx] = time.monotonic()
+        self._respond(200, token)
 
-            if current_token is None or token == current_token:
-                # Valid unlock: token matches, or lock was already released
-                # (e.g. by watchdog). Either way, return success.
-                GPU_LOCK_TOKENS.pop(gpu_idx, None)
-                release_local_gpu_lock(gpu_idx)
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"unlocked")
-            else:
-                # Token mismatch: a different holder owns this lock now.
-                # Return success anyway — the caller's lock was already
-                # released (by watchdog or timeout), and the current holder
-                # must not be disturbed.
-                log.warning("unlock-gpu %d: token mismatch (got %s, current %s), "
-                           "ignoring stale unlock", gpu_idx, token, current_token)
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"stale-unlock-ignored")
+    def _handle_unlock_gpu(self, gpu_idx, params):
+        """Release GPU lock if token matches. Idempotent — always returns 200."""
+        token_vals = params.get("token")
+        token = token_vals[0] if token_vals else None
+        current_token = GPU_LOCK_TOKENS.get(gpu_idx)
+
+        if current_token is not None and token != current_token:
+            # Token mismatch: a different holder owns this lock now.
+            # Return success — the caller's lock was already released
+            # (by watchdog or timeout). Don't disturb the current holder.
+            log.warning("unlock-gpu %d: token mismatch (got %s, current %s), "
+                        "ignoring stale unlock", gpu_idx, token, current_token)
+            self._respond(200, b"stale-unlock-ignored")
             return
 
-        self.send_response(404)
-        self.end_headers()
-        self.wfile.write(b"unknown path")
+        GPU_LOCK_TOKENS.pop(gpu_idx, None)
+        release_local_gpu_lock(gpu_idx)
+        self._respond(200, b"unlocked")
 
     def log_message(self, format, *args):
         pass
