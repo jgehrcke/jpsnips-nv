@@ -150,6 +150,10 @@ VERIFY_PARTIALS_BUFS = {}    # {gpu_idx: CUdeviceptr}
 # unrecoverable GPU state corruption.
 FATAL_CUDA_ERROR = None  # Set to error string on fatal error
 
+# Graceful shutdown coordination. Set by SIGTERM/SIGINT handler.
+# Components check this to wind down cleanly.
+SHUTTING_DOWN = threading.Event()
+
 # Shared chunk allocations tracked for cleanup on exit.
 # {gpu_idx: (va_ptr, alloc_size, alloc_handle)}
 SHARED_CHUNK_ALLOCS = {}
@@ -270,13 +274,25 @@ def main():
     threading.Thread(target=chunk_refresh_loop, daemon=True).start()
     start_peer_poll_thread()
 
-    shutdown = threading.Event()
-    signal.signal(signal.SIGTERM, lambda sig, frame: shutdown.set())
-    signal.signal(signal.SIGINT, lambda sig, frame: shutdown.set())
+    def _signal_handler(signum, frame):
+        signame = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+        log.info("received %s — initiating graceful shutdown", signame)
+        SHUTTING_DOWN.set()
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
     log.info("all threads started, main thread waiting")
-    shutdown.wait()
-    log.info("received shutdown signal, exiting")
+    SHUTTING_DOWN.wait()
+
+    # Graceful shutdown sequence:
+    # 1. SHUTTING_DOWN is set — HTTP handler now rejects /prepare-chunk
+    #    with 503 so remote pods stop acquiring our GPU locks.
+    # 2. Wait for any remotely-held local GPU locks to be released.
+    _wait_for_local_locks_released()
+    # 3. The poll thread checks SHUTTING_DOWN and finishes its current
+    #    benchmark before exiting (daemon thread, will die with process).
+    log.info("graceful shutdown complete")
 
 
 def cuda_init():
@@ -576,6 +592,29 @@ def release_remote_gpu_lock(peer_host: str, port: int, gpu_index: int,
             time.sleep(0.5)
 
 
+def _wait_for_local_locks_released():
+    """Wait briefly for remote pods to release locks they hold on our GPUs.
+
+    After SHUTTING_DOWN is set, the HTTP handler rejects new lock requests
+    with 503. Existing lock holders should release within a few ms (their
+    DtoD benchmark completes). We wait up to 3s for all locks to clear.
+    """
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        held = [idx for idx in GPU_LOCKS if GPU_LOCKS[idx].locked()]
+        if not held:
+            log.info("shutdown: all local GPU locks released")
+            return
+        holders = [f"GPU {idx} by {GPU_LOCK_HOLDERS.get(idx, '?')}"
+                   for idx in held]
+        log.info("shutdown: waiting for local locks: %s", ", ".join(holders))
+        time.sleep(0.1)
+    held = [idx for idx in GPU_LOCKS if GPU_LOCKS[idx].locked()]
+    if held:
+        log.warning("shutdown: %d local locks still held after 3s, proceeding",
+                    len(held))
+
+
 def start_gpu_lock_watchdog():
     """Start a daemon thread that force-releases GPU locks held longer than
     GPU_LOCK_TIMEOUT_S. Guards against crashed remote clients that acquired
@@ -691,8 +730,10 @@ def chunk_refresh_loop():
     rather than relying on memory allocated once at startup. May help
     detect or recover from degraded IMEX daemon state.
     """
-    while True:
-        time.sleep(CHUNK_REFRESH_INTERVAL_S)
+    while not SHUTTING_DOWN.is_set():
+        SHUTTING_DOWN.wait(CHUNK_REFRESH_INTERVAL_S)
+        if SHUTTING_DOWN.is_set():
+            break
         for gpu_idx in range(GPUS_PER_NODE):
             t0 = time.monotonic()
             ensure_cuda_context(gpu_idx)
@@ -1188,6 +1229,10 @@ def _run_one_poll_round():
         peer_idx = pod_name.rsplit("-", 1)[1]
         log.debug("benchmark %s-g%d -> local-g%d",
                   pod_name, remote_gpu_idx, local_gpu_idx)
+        if SHUTTING_DOWN.is_set():
+            log.info("poll round: shutdown requested, finishing after %d/%d benchmarks",
+                     len(results), len(work_items))
+            break
         status, peer_node, lock_wait, bench_ms = import_and_verify_chunk(
             pod_name, peer_host, HTTPD_PORT,
             remote_gpu_idx, local_gpu_idx)
@@ -1226,7 +1271,7 @@ def peer_poll_loop():
     time.sleep(POLL_INTERVAL_S)
     next_deadline = time.monotonic()
 
-    while True:
+    while not SHUTTING_DOWN.is_set():
         next_deadline += POLL_INTERVAL_S
         try:
             _run_one_poll_round()
@@ -1234,6 +1279,9 @@ def peer_poll_loop():
             log.info("peer poll: DNS name does not exist yet (expected at startup)")
         except Exception:
             log.exception("peer poll error:")
+        if SHUTTING_DOWN.is_set():
+            log.info("peer poll: shutdown requested, exiting loop")
+            break
         remaining = next_deadline - time.monotonic()
         log.info("waiting %.1fs for next poll deadline", max(0, remaining))
         _wait_until(next_deadline)
@@ -1296,6 +1344,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self._respond(404, b"unknown path")
             return
 
+        if SHUTTING_DOWN.is_set():
+            self._respond(503, b"shutting down")
+            return
+
         result = self._parse_gpu_index()
         if result is None:
             return
@@ -1332,6 +1384,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
             return
 
         if "/lock-gpu" in parsed.path:
+            if SHUTTING_DOWN.is_set():
+                self._respond(503, b"shutting down")
+                return
             holder_vals = params.get("holder")
             holder = holder_vals[0] if holder_vals else self.client_address[0]
             self._handle_lock_gpu(gpu_idx, holder)
