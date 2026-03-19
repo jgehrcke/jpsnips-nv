@@ -31,15 +31,18 @@ import traceback
 
 import requests as requests_lib
 
-# Dashboard diagnostics go to stderr so they survive TUI crashes and
-# don't interfere with Rich's screen rendering on stdout.
-logging.basicConfig(
-    stream=sys.stderr,
-    level=logging.WARNING,
-    format="%(asctime)s dashboard %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+# Dashboard diagnostics go to a log file to avoid flickering caused by
+# stderr writes bleeding through the TUI's alternate screen buffer.
+# The log file path is printed to stderr on startup so the user knows
+# where to look.
+_dashboard_log_path = "/tmp/atack-dashboard.log"
+_log_handler = logging.FileHandler(_dashboard_log_path, mode="w")
+_log_handler.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S"))
 dlog = logging.getLogger("dashboard")
+dlog.setLevel(logging.INFO)
+dlog.addHandler(_log_handler)
+print(f"dashboard log: {_dashboard_log_path}", file=sys.stderr)
 import tty
 
 from rich.console import Console
@@ -146,26 +149,47 @@ def get_atack_pods():
         else:
             status = phase
 
-        # Probe /healthz directly to detect CUDA_ERROR_ILLEGAL_STATE.
-        # This is the authoritative liveness signal — more reliable than
-        # inferring from pod conditions (which have false positives during
-        # startup and after restarts).
+        # Kubelet's liveness probe status from pod conditions.
         liveness_failing = False
+        for cond in item["status"].get("conditions", []):
+            if cond.get("type") == "Ready" and cond.get("status") == "False":
+                msg = cond.get("message", "")
+                if "liveness" in msg.lower() or "probe" in msg.lower():
+                    liveness_failing = True
+        # Also detect restart from liveness failure.
+        if cstatuses:
+            last_state = cstatuses[0].get("lastState", {})
+            terminated = last_state.get("terminated", {})
+            if terminated.get("reason") == "Error" and restart_count > 0:
+                liveness_failing = True
+
+        # Direct HTTP probe of /healthz.
         cuda_fatal = ""
+        direct_probe = ""
         pod_ip = item["status"].get("podIP")
         if pod_ip and status == "Ready":
             try:
                 resp = requests_lib.get(f"http://{pod_ip}:1337/healthz", timeout=(0.5, 1))
-                if resp.status_code == 500:
+                if resp.status_code == 200:
+                    direct_probe = "ok"
+                elif resp.status_code == 500:
+                    direct_probe = f"HTTP 500"
                     liveness_failing = True
                     if "ILLEGAL_STATE" in resp.text:
                         cuda_fatal = resp.text
-            except Exception:
-                pass
+                else:
+                    direct_probe = f"HTTP {resp.status_code}"
+            except requests_lib.exceptions.ConnectionError:
+                direct_probe = "conn refused"
+            except requests_lib.exceptions.Timeout:
+                direct_probe = "timeout"
+            except Exception as exc:
+                direct_probe = str(exc)[:20]
 
         pods.append({"name": name, "idx": idx, "node": node, "age": age,
                       "status": status, "liveness_failing": liveness_failing,
-                      "restart_count": restart_count, "cuda_fatal": cuda_fatal})
+                      "restart_count": restart_count, "cuda_fatal": cuda_fatal,
+                      "direct_probe": direct_probe})
     return sorted(pods, key=lambda p: p["node"])
 
 
@@ -321,26 +345,40 @@ def build_pods_table(atack_pods):
     table.add_column("Node")
     table.add_column("Age")
     table.add_column("Status")
+    table.add_column("Direct Probe")
     table.add_column("Liveness")
+    table.add_column("Last Result")
     table.add_column("Fatal CUDA Error")
 
     for p in atack_pods:
         color = status_color(p["status"])
+        probe = p.get("direct_probe", "")
+        if probe == "ok":
+            probe_text = Text("ok", style="green")
+        elif probe:
+            probe_text = Text(probe, style="red")
+        else:
+            probe_text = Text("")
+        cuda_fatal = ""
+        if p.get("cuda_fatal"):
+            cuda_fatal = Text("ILLEGAL_STATE", style="red bold")
+        last_result = p.get("last_result_ago")
+        if last_result is not None:
+            last_result_text = Text(f"{last_result}s ago")
+        else:
+            last_result_text = Text("")
         if p.get("liveness_failing"):
             liveness = Text("FAILING", style="red bold")
         elif p.get("status") == "Ready":
             liveness = Text("ok", style="green")
         else:
-            liveness = ""
-        cuda_fatal = ""
-        if p.get("cuda_fatal"):
-            cuda_fatal = Text("ILLEGAL_STATE", style="red bold")
+            liveness = Text("")
         table.add_row(p["idx"], p["name"], p["node"], p.get("age", ""),
                       Text(p["status"], style=color),
-                      liveness, cuda_fatal)
+                      probe_text, liveness, last_result_text, cuda_fatal)
 
     if not atack_pods:
-        table.add_row("—", "no pods", "", "", "", "", "")
+        table.add_row("—", "no pods", "", "", "", "", "", "", "")
 
     return Panel(table, title="Workload Pods", title_align="left",
                  border_style="blue", padding=(0, 1))
@@ -390,8 +428,11 @@ def build_cd_status_panel(cd_status):
                  border_style="blue", padding=(0, 1))
 
 
+MATRIX_STALE_S = 15
+
+
 def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
-                       matrix_timestamp, detected_poll_s):
+                       matrix_timestamp, detected_poll_s, matrix_cell_times):
     title = "Bandwidth matrix (GB/s)"
 
     parts = []
@@ -444,6 +485,8 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
         node = node_map.get(pod_nodes.get(pod_idx, "?"), "?")
         row_label = f"{pod_idx}-{node}-{gpu_idx}"
         peers = latest_matrix.get(row_key, {})
+        row_age = time.monotonic() - matrix_cell_times.get(row_key, 0)
+        is_stale = row_age > MATRIX_STALE_S
 
         row_pod = row_key.split("-", 1)[0]
         cells = [row_label]
@@ -451,7 +494,7 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
             col_pod = c.split("-", 1)[0]
             if col_pod == row_pod:
                 cells.append(Text("—", style="dim"))
-            elif not peers:
+            elif not peers or is_stale:
                 cells.append(Text("?", style="yellow"))
             else:
                 val = peers.get(c, "?")
@@ -477,7 +520,8 @@ def build_header():
 
 
 def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
-                 live_matrix_keys, matrix_timestamp, detected_poll_s):
+                 live_matrix_keys, matrix_timestamp, detected_poll_s,
+                 matrix_cell_times):
     mid_row_h = max(len(cd_daemons), len(cd_status["nodes"]), 1) + 4
 
     layout = Layout()
@@ -497,7 +541,8 @@ def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
     layout["cd_status"].update(build_cd_status_panel(cd_status))
     layout["matrix"].update(
         build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
-                           matrix_timestamp, detected_poll_s))
+                           matrix_timestamp, detected_poll_s,
+                           matrix_cell_times))
     return layout
 
 
@@ -644,6 +689,7 @@ def cd_status_poller(state, poll_s, linger_s):
 def main():
     pod_nodes = {}
     latest_matrix = {}       # {row_key: {col_key: value_str}} — updated directly
+    matrix_cell_times = {}   # {row_key: monotonic time of last update}
     matrix_timestamp = None  # When we last got any result line
     detected_poll_s = None
     last_result_times = {}
@@ -655,6 +701,7 @@ def main():
     followers = {}
     fd_to_pod = {}
     line_bufs = {}
+    follower_backoff = {}  # {pod_name: monotonic time of last failure}
     last_follower_check = 0
 
     LINGER_S = 15.0
@@ -723,7 +770,8 @@ def main():
                         p["name"] for p in atack_pods if p["status"] == "Ready"
                     )
 
-                    # Clean up dead followers first.
+                    # Clean up dead followers. Track when they died to
+                    # avoid spam-restarting (backoff: don't retry for 10s).
                     for pod_name in list(followers.keys()):
                         proc = followers[pod_name]
                         if proc.poll() is not None:
@@ -731,6 +779,7 @@ def main():
                             fd_to_pod.pop(fd, None)
                             line_bufs.pop(fd, None)
                             del followers[pod_name]
+                            follower_backoff[pod_name] = now
                             dlog.warning("log follower for %s died (rc=%s)",
                                          pod_name, proc.returncode)
 
@@ -746,8 +795,11 @@ def main():
                             dlog.warning("killed follower for non-ready pod %s",
                                          pod_name)
 
-                    # Start followers for new Ready pods.
+                    # Start followers for new Ready pods (with backoff).
                     for pod_name in ready_names - set(followers.keys()):
+                        last_fail = follower_backoff.get(pod_name, 0)
+                        if now - last_fail < 10:
+                            continue
                         dlog.warning("starting log follower for %s", pod_name)
                         proc = start_log_follower(pod_name)
                         followers[pod_name] = proc
@@ -807,6 +859,7 @@ def main():
                                     if row_key not in latest_matrix:
                                         latest_matrix[row_key] = {}
                                     latest_matrix[row_key][col_key] = val
+                                    matrix_cell_times[row_key] = time.monotonic()
                                     seen_gpus.add(int(local_gpu))
                                     seen_gpus.add(int(remote_gpu))
                                 new_gpn = max(seen_gpus) + 1
@@ -829,6 +882,7 @@ def main():
                                     if val.endswith(" GB/s"):
                                         val = val[:-5]
                                     latest_matrix[row_key][f"{peer_idx}-0"] = val
+                                matrix_cell_times[row_key] = time.monotonic()
 
                             # Auto-detect poll interval from result cadence.
                             result_now = time.monotonic()
@@ -849,15 +903,26 @@ def main():
                 for key in list(latest_matrix.keys()):
                     if key not in live_matrix_keys:
                         del latest_matrix[key]
+                        matrix_cell_times.pop(key, None)
 
                 if not latest_matrix:
                     matrix_timestamp = None
 
                 # --- Render ---
+                # Enrich pod data with last-result age from log parsing.
+                now_mono = time.monotonic()
+                display_pods = []
+                for p in pods_state.pods:
+                    p2 = dict(p)
+                    t = last_result_times.get(p["idx"])
+                    p2["last_result_ago"] = int(now_mono - t) if t else None
+                    display_pods.append(p2)
+
                 live.update(build_layout(
-                    pods_state.pods, cd_daemon_state.daemons,
+                    display_pods, cd_daemon_state.daemons,
                     cd_status_state.status, latest_matrix, pod_nodes,
-                    live_matrix_keys, matrix_timestamp, detected_poll_s))
+                    live_matrix_keys, matrix_timestamp, detected_poll_s,
+                    matrix_cell_times))
 
                 time.sleep(1.0 / REFRESH_HZ)
 
