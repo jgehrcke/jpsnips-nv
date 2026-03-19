@@ -1523,7 +1523,8 @@ def _run_one_poll_round():
     # If the entire round completed without any CUDA errors, clear the
     # fatal flag. This restores liveness after a transient ILLEGAL_STATE.
     global FATAL_CUDA_ERROR
-    has_errors = any("err" in v.lower() for v in results.values())
+    _error_tags = ("err", "ILLEGAL_STATE", "INVALID_HANDLE", "MISMATCH", "lock-err")
+    has_errors = any(any(tag in v for tag in _error_tags) for v in results.values())
     if not has_errors and FATAL_CUDA_ERROR is not None:
         log.info("LIVENESS FLIP failing→healthy: round completed without "
                  "errors, clearing FATAL_CUDA_ERROR (was: %s)", FATAL_CUDA_ERROR)
