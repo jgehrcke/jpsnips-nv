@@ -1190,7 +1190,10 @@ def evict_peer_imports(peer_pod_name):
     """
     evict_keys = [k for k, v in IMPORT_CACHE.items() if v[3] == peer_pod_name]
     for key in evict_keys:
-        imported_handle, va_ptr, alloc_size, _peer = IMPORT_CACHE.pop(key)
+        entry = IMPORT_CACHE.pop(key, None)
+        if entry is None:
+            continue  # Already evicted by another thread.
+        imported_handle, va_ptr, alloc_size, _peer = entry
         local_gpu_idx = key[0]
         try:
             ensure_cuda_context(local_gpu_idx)
@@ -1276,7 +1279,10 @@ def _evict_stale_cache_entries(active_handle_bytes):
     """
     stale_keys = [k for k in IMPORT_CACHE if k[1] not in active_handle_bytes]
     for key in stale_keys:
-        imported_handle, va_ptr, alloc_size, peer = IMPORT_CACHE.pop(key)
+        entry = IMPORT_CACHE.pop(key, None)
+        if entry is None:
+            continue  # Already evicted by another thread.
+        imported_handle, va_ptr, alloc_size, peer = entry
         local_gpu_idx = key[0]
         try:
             ensure_cuda_context(local_gpu_idx)
