@@ -723,6 +723,10 @@ def main():
                         del latest_matrix[key]
                         matrix_round_num.pop(key, None)
 
+                # Reset timestamp when matrix is empty (all pods gone).
+                if not latest_matrix:
+                    matrix_timestamp = None
+
                 # --- Render ---
                 live.update(build_layout(
                     atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
