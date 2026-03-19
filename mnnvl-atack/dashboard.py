@@ -134,6 +134,7 @@ def get_atack_pods():
     for item in data["items"]:
         name = item["metadata"]["name"]
         idx = name.rsplit("-", 1)[1]
+        uid = item["metadata"].get("uid", "")
         node = item["spec"].get("nodeName", "?")
         created = item["metadata"].get("creationTimestamp", "")
         age = ""
@@ -179,7 +180,7 @@ def get_atack_pods():
                     if "liveness" in msg.lower():
                         liveness_failing = True
 
-        pods.append({"name": name, "idx": idx, "node": node, "age": age,
+        pods.append({"name": name, "idx": idx, "uid": uid, "node": node, "age": age,
                       "status": status, "liveness_failing": liveness_failing,
                       "restart_count": restart_count,
                       "cuda_fatal": "", "direct_probe": "", "node_ip": None})
@@ -960,8 +961,9 @@ def main():
                             # Auto-detect poll interval from result cadence.
                             result_now = time.monotonic()
                             result_count[pod_idx] = result_count.get(pod_idx, 0) + 1
-                            if pod_idx in last_result_times and result_count[pod_idx] > 2:
-                                interval = result_now - last_result_times[pod_idx]
+                            prev = last_result_times.get(pod_idx)
+                            if prev and result_count[pod_idx] > 2:
+                                interval = result_now - prev[0]
                                 if 0.5 < interval < 60:
                                     if detected_poll_s is None:
                                         bootstrap_intervals.append(interval)
@@ -970,7 +972,13 @@ def main():
                                             detected_poll_s = s[len(s) // 2]
                                     else:
                                         detected_poll_s = 0.8 * detected_poll_s + 0.2 * interval
-                            last_result_times[pod_idx] = result_now
+                            # Store (timestamp, uid) so we can detect pod replacements.
+                            pod_uid = None
+                            for p in pods_state.pods:
+                                if p["idx"] == pod_idx:
+                                    pod_uid = p.get("uid")
+                                    break
+                            last_result_times[pod_idx] = (result_now, pod_uid)
 
                 # Remove matrix entries for pods no longer live.
                 for key in list(latest_matrix.keys()):
@@ -983,12 +991,17 @@ def main():
 
                 # --- Render ---
                 # Enrich pod data with last-result age from log parsing.
+                # Ignore stale entries where the pod UID changed (pod was
+                # replaced — same index, different pod).
                 now_mono = time.monotonic()
                 display_pods = []
                 for p in pods_state.pods:
                     p2 = dict(p)
-                    t = last_result_times.get(p["idx"])
-                    p2["last_result_ago"] = int(now_mono - t) if t else None
+                    entry = last_result_times.get(p["idx"])
+                    if entry and entry[1] == p.get("uid"):
+                        p2["last_result_ago"] = int(now_mono - entry[0])
+                    else:
+                        p2["last_result_ago"] = None
                     display_pods.append(p2)
 
                 live.update(build_layout(
