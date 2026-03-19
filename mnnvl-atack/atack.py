@@ -709,13 +709,10 @@ def _free_retired_chunks(gpu_idx):
 def _refresh_shared_chunk_for_gpu(gpu_idx):
     """Replace the shared chunk on one GPU with a fresh allocation.
 
-    The old allocation is retired and freed only after CHUNK_RETIRE_S
-    seconds (~3 refresh cycles). This prevents SIGSEGV / INVALID_HANDLE
-    for remote pods that imported the old fabric handle and may still
-    be mid-DtoD.
-
-    Acquires the GPU lock to prevent benchmarks from reading during the
-    swap. The lock hold time is ~1-2 ms (allocate + fill + sync).
+    The allocation + fill happens WITHOUT the GPU lock so a slow
+    cuMemCreate or cuMemsetD32 can't block benchmarks. The lock is held
+    only for the atomic pointer swap of the alloc handle (<1ms).
+    The old allocation is retired and freed after CHUNK_RETIRE_S seconds.
 
     Precondition: the GPU's CUDA context must be pushed.
 
@@ -724,23 +721,28 @@ def _refresh_shared_chunk_for_gpu(gpu_idx):
     """
     _free_retired_chunks(gpu_idx)
 
-    # Retire the current allocation, allocate a new one under the lock.
-    acquire_local_gpu_lock(gpu_idx)
-    try:
-        old = SHARED_CHUNK_ALLOCS.get(gpu_idx)
-        if old is not None:
-            RETIRED_CHUNKS.append(
-                (gpu_idx, old[0], old[1], old[2], time.monotonic()))
-            last_served = LAST_CHUNK_SERVED_TIME.get(gpu_idx)
-            if last_served is not None:
-                ago = time.monotonic() - last_served
-                log.info("GPU %d: retired old chunk (last served %.1fs ago)",
-                         gpu_idx, ago)
-            else:
-                log.info("GPU %d: retired old chunk (never served)", gpu_idx)
-        _prepare_shared_chunk_for_gpu(gpu_idx)
-    finally:
-        release_local_gpu_lock(gpu_idx)
+    # Stash old allocation before overwriting.
+    old = SHARED_CHUNK_ALLOCS.get(gpu_idx)
+
+    # Allocate and fill the new chunk OUTSIDE the lock. This is the
+    # slow part (~1-30ms, sometimes longer) that must not block benchmarks.
+    # _prepare_shared_chunk_for_gpu writes to SHARED_CHUNK_ALLOCS,
+    # SHARED_CHUNK_ALLOC_HANDLES, and SHARED_CHUNK_STATIC_META.
+    # The HTTP handler reads SHARED_CHUNK_ALLOC_HANDLES — Python's GIL
+    # ensures the dict assignment is atomic.
+    _prepare_shared_chunk_for_gpu(gpu_idx)
+
+    # Retire the old allocation.
+    if old is not None:
+        RETIRED_CHUNKS.append(
+            (gpu_idx, old[0], old[1], old[2], time.monotonic()))
+        last_served = LAST_CHUNK_SERVED_TIME.get(gpu_idx)
+        if last_served is not None:
+            ago = time.monotonic() - last_served
+            log.info("GPU %d: retired old chunk (last served %.1fs ago)",
+                     gpu_idx, ago)
+        else:
+            log.info("GPU %d: retired old chunk (never served)", gpu_idx)
 
 
 def chunk_refresh_loop():
