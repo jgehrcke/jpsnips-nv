@@ -126,11 +126,50 @@ def get_node_ip(node_name):
     return None
 
 
+def _get_liveness_failure_events(pod_uids):
+    """Return {pod_name: age_seconds} for recent liveness probe failures.
+
+    Only returns events matching the current pod UIDs, so events from
+    previous pod incarnations (same name, different UID) are ignored.
+    """
+    data = kubectl_json(["get", "events", "--field-selector",
+                         "reason=Unhealthy"])
+    if not data or "items" not in data:
+        return {}
+    result = {}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for ev in data["items"]:
+        msg = ev.get("message", "")
+        if "liveness" not in msg.lower():
+            continue
+        involved = ev.get("involvedObject", {})
+        pod_name = involved.get("name", "")
+        pod_uid = involved.get("uid", "")
+        # Skip events from previous pod incarnations.
+        if pod_uid and pod_uids.get(pod_name) != pod_uid:
+            continue
+        ts_str = ev.get("lastTimestamp") or ev.get("eventTime", "")
+        if not ts_str or not pod_name:
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            age_s = (now - ts).total_seconds()
+            if pod_name not in result or age_s < result[pod_name]:
+                result[pod_name] = age_s
+        except Exception:
+            continue
+    return result
+
+
 def get_atack_pods():
     """Return list of dicts: [{name, idx, node, status, ...}, ...]."""
     data = kubectl_json(["get", "pods", "-l", "app=atack"])
     if not data or "items" not in data:
         return []
+    # Build UID map for filtering events to current pod incarnations.
+    pod_uids = {item["metadata"]["name"]: item["metadata"].get("uid", "")
+                for item in data["items"]}
+    lp_events = _get_liveness_failure_events(pod_uids)
     pods = []
     for item in data["items"]:
         name = item["metadata"]["name"]
@@ -167,22 +206,11 @@ def get_atack_pods():
         else:
             status = phase
 
-        # Kubelet's liveness probe status. Only look at current pod
-        # conditions (not lastState, which is historical and persists
-        # forever after a restart — causes false positives).
-        liveness_failing = False
-        if status == "Ready":
-            liveness_failing = False  # Kubelet says Ready = liveness OK.
-        else:
-            # Pod not ready — check if it's specifically due to liveness.
-            for cond in item["status"].get("conditions", []):
-                if cond.get("type") == "Ready" and cond.get("status") == "False":
-                    msg = cond.get("message", "")
-                    if "liveness" in msg.lower():
-                        liveness_failing = True
+        # Age of most recent liveness probe failure event from kubelet.
+        liveness_event_age = lp_events.get(name)  # seconds, or None.
 
         pods.append({"name": name, "idx": idx, "uid": uid, "node": node, "age": age,
-                      "status": status, "liveness_failing": liveness_failing,
+                      "status": status, "lp_fail_age": liveness_event_age,
                       "restart_count": restart_count,
                       "cuda_fatal": "", "direct_probe": "", "node_ip": None})
     return sorted(pods, key=lambda p: p["node"])
@@ -195,10 +223,11 @@ def probe_pod_healthz(pod):
     liveness_failing.
     """
     node_ip = pod.get("node_ip")
-    if not node_ip or pod["status"] != "Ready":
+    if not node_ip:
         return
 
     # Use a short socket timeout. urllib does not retry internally.
+    # Store probe time for freshness display.
     # The timeout applies per socket operation (connect, read), not
     # wall-clock total, but with a small healthz response (~2 bytes)
     # the total is effectively bounded at ~0.5s.
@@ -212,11 +241,9 @@ def probe_pod_healthz(pod):
                 pod["direct_probe"] = body.strip()[:30]
                 if "ILLEGAL_STATE" in body:
                     pod["cuda_fatal"] = body.strip()
-                    pod["liveness_failing"] = True
     except urllib.error.HTTPError as exc:
         pod["direct_probe"] = f"HTTP {exc.code}"
         if exc.code == 500:
-            pod["liveness_failing"] = True
             try:
                 body = exc.read().decode("utf-8", errors="replace")
             except Exception:
@@ -229,6 +256,7 @@ def probe_pod_healthz(pod):
         pod["direct_probe"] = "unreachable"
     except Exception as exc:
         pod["direct_probe"] = str(exc)[:20]
+    pod["probe_time"] = time.monotonic()
 
 
 def get_cd_daemons():
@@ -433,19 +461,23 @@ def build_pods_table(atack_pods):
     table.add_column("#", style="bold", width=3)
     table.add_column("Pod")
     table.add_column("Node")
-    table.add_column("Age")
-    table.add_column("Status")
+    table.add_column("Age", min_width=6)
+    table.add_column("Status", min_width=17)
     table.add_column("Restarts")
-    table.add_column("Direct Probe")
-    table.add_column("Liveness")
+    table.add_column("Direct Liveness Probe")
+    table.add_column("LP Fail Event")
     table.add_column("Last Result")
     for p in atack_pods:
         color = status_color(p["status"])
         probe = p.get("direct_probe", "")
+        probe_age = ""
+        pt = p.get("probe_time")
+        if pt:
+            probe_age = f" ({int(time.monotonic() - pt)}s ago)"
         if probe == "ok":
-            probe_text = Text("ok", style="green")
+            probe_text = Text(f"ok{probe_age}", style="green")
         elif probe:
-            probe_text = Text(probe, style="red")
+            probe_text = Text(f"{probe}{probe_age}", style="red")
         else:
             probe_text = Text("")
         last_result = p.get("last_result_ago")
@@ -453,10 +485,11 @@ def build_pods_table(atack_pods):
             last_result_text = Text(f"{last_result}s ago")
         else:
             last_result_text = Text("")
-        if p.get("liveness_failing"):
-            liveness = Text("FAILING", style="red bold")
-        elif p.get("status") == "Ready":
-            liveness = Text("ok", style="green")
+        lp_age = p.get("lp_fail_age")
+        if lp_age is not None and lp_age < 30:
+            liveness = Text(f"{int(lp_age)}s ago", style="red")
+        elif lp_age is not None:
+            liveness = Text(f"{int(lp_age)}s ago", style="dim")
         else:
             liveness = Text("")
         restarts = p.get("restart_count", 0)
@@ -748,12 +781,15 @@ def pods_poller(state, poll_s, linger_s):
             if now - gone[name]["vanished_at"] > linger_s:
                 del gone[name]
 
-        # Probe healthz for all Ready pods in parallel via node IP.
-        ready_pods = [p for p in fresh if p["status"] == "Ready" and p.get("node_ip")]
-        if ready_pods:
+        # Probe healthz for all pods with a node IP — not just Ready ones.
+        # A failing pod still has its HTTP server running until kubelet
+        # kills the container, so we can show the probe result during the
+        # liveness failure window.
+        probeable = [p for p in fresh if p.get("node_ip")]
+        if probeable:
             with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=len(ready_pods)) as pool:
-                pool.map(probe_pod_healthz, ready_pods)
+                    max_workers=len(probeable)) as pool:
+                pool.map(probe_pod_healthz, probeable)
 
         merged = fresh + [g["data"] for g in gone.values()]
         prev_pods = merged
