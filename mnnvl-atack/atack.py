@@ -1004,6 +1004,7 @@ def _run_one_poll_round():
     Raises:
         dns.resolver.NXDOMAIN: If peer DNS does not exist yet.
     """
+    round_t0 = time.monotonic()
     peers = discover_peers()
     if not peers:
         log.info("peer poll: no peers discovered yet")
@@ -1043,9 +1044,11 @@ def _run_one_poll_round():
         log.info("round stats: DtoD min=%.1f max=%.1f mean=%.1f ms, "
                  "max_lock_wait=%.1f ms", bmin, bmax, bmean, max_lock_wait_ms)
 
+    round_dur = time.monotonic() - round_t0
     my_idx = K8S_PODNAME.rsplit("-", 1)[1]
     parts = [f"{k}:{v}" for k, v in sorted(results.items())]
-    log.info("result(%s@%s): %s", my_idx, K8S_NODENAME, " ".join(parts))
+    log.info("result(%s@%s): round_time=%.1fs %s",
+             my_idx, K8S_NODENAME, round_dur, " ".join(parts))
 
 
 def peer_poll_loop():
