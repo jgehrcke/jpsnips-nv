@@ -73,6 +73,7 @@ from urllib.parse import urlparse, parse_qs
 
 import dns.resolver
 import requests
+from requests.adapters import HTTPAdapter
 
 from cuda.bindings import driver, runtime, nvrtc
 
@@ -83,6 +84,14 @@ logging.basicConfig(
     format="%(asctime)s.%(msecs)03dZ %(levelname)s: %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
+
+# HTTP session with limited retries. urllib3 defaults to aggressive retries
+# on DNS failures which blocks the poll loop. Allow at most 1 retry.
+# HTTP session with no internal retries. Retrying is done explicitly
+# in the calling code where we can control timing and log level.
+_http_session = requests.Session()
+_http_session.mount("http://", HTTPAdapter(max_retries=0))
+_http_session.mount("https://", HTTPAdapter(max_retries=0))
 
 # Configuration from environment.
 HTTPD_PORT = int(os.environ.get("HTTPD_PORT", "1337"))
@@ -122,11 +131,12 @@ LAST_EXPORTED_HANDLE_BYTES = {}  # {gpu_idx: bytes} — for detecting identical 
 # The lock is acquired locally (for the DtoD destination GPU) and via HTTP
 # (for the remote source GPU). Remote locks auto-expire after GPU_LOCK_TIMEOUT_S
 # to handle crashed clients.
-GPU_LOCK_TIMEOUT_S = 30
-GPU_LOCK_ACQUIRE_HTTP_TIMEOUT_S = 25
+GPU_LOCK_TIMEOUT_S = 5
+GPU_LOCK_ACQUIRE_HTTP_TIMEOUT_S = 8
 GPU_LOCKS = {}           # {gpu_idx: threading.Lock}
 GPU_LOCK_TIMESTAMPS = {} # {gpu_idx: monotonic time of last acquire}
 GPU_LOCK_TOKENS = {}     # {gpu_idx: str} — token identifying current lock holder
+GPU_LOCK_HOLDERS = {}    # {gpu_idx: str} — who holds the lock (IP or "local")
 
 VERIFY_LOCAL_BUFS = {}       # {gpu_idx: CUdeviceptr}
 VERIFY_LOCAL_BUF_SIZES = {}  # {gpu_idx: int}
@@ -163,7 +173,7 @@ def cuda_cleanup():
         try:
             url = (f"http://{peer_host}:{port}/unlock-gpu"
                    f"?gpu_index={gpu_index}&token={token}")
-            requests.post(url, timeout=(0.3, 0.5))
+            _http_session.post(url, timeout=(0.3, 0.5))
             log.info("cuda_cleanup: released remote lock %s gpu %d",
                      peer_host, gpu_index)
         except Exception:
@@ -473,6 +483,7 @@ def acquire_local_gpu_lock(gpu_idx) -> float:
     t0 = time.monotonic()
     GPU_LOCKS[gpu_idx].acquire()
     GPU_LOCK_TIMESTAMPS[gpu_idx] = time.monotonic()
+    GPU_LOCK_HOLDERS[gpu_idx] = "local"
     wait_ms = (time.monotonic() - t0) * 1000
     log.debug("local lock GPU %d: acquired in %.1f ms", gpu_idx, wait_ms)
     return wait_ms
@@ -500,12 +511,13 @@ def acquire_remote_gpu_lock(peer_host: str, port: int, gpu_index: int) -> tuple[
     """
     log.debug("remote lock %s GPU %d: acquiring", peer_host, gpu_index)
     t0 = time.monotonic()
-    resp = requests.post(
-        f"http://{peer_host}:{port}/lock-gpu?gpu_index={gpu_index}",
+    resp = _http_session.post(
+        f"http://{peer_host}:{port}/lock-gpu?gpu_index={gpu_index}"
+        f"&holder={K8S_PODNAME}",
         timeout=(1, GPU_LOCK_ACQUIRE_HTTP_TIMEOUT_S),
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"lock-gpu failed: HTTP {resp.status_code}: {resp.text}")
+        raise LockError(f"lock-gpu failed: HTTP {resp.status_code}: {resp.text}")
     wait_ms = (time.monotonic() - t0) * 1000
     token = resp.text
     log.debug("remote lock %s GPU %d: acquired in %.1f ms",
@@ -528,7 +540,7 @@ def release_remote_gpu_lock(peer_host: str, port: int, gpu_index: int,
     url = f"http://{peer_host}:{port}/unlock-gpu?gpu_index={gpu_index}&token={token}"
     for attempt in range(7):
         try:
-            requests.post(url, timeout=(1, 2))
+            _http_session.post(url, timeout=(1, 2))
             return
         except Exception as exc:
             log.warning("failed to release remote GPU lock on %s gpu %d "
@@ -551,9 +563,12 @@ def start_gpu_lock_watchdog():
                     continue
                 if now - ts > GPU_LOCK_TIMEOUT_S:
                     if GPU_LOCKS[gpu_idx].locked():
+                        holder = GPU_LOCK_HOLDERS.get(gpu_idx, "unknown")
                         log.warning("GPU lock watchdog: force-releasing GPU %d "
-                                    "(held for %.0fs)", gpu_idx, now - ts)
+                                    "(held for %.0fs by %s)",
+                                    gpu_idx, now - ts, holder)
                         GPU_LOCK_TOKENS.pop(gpu_idx, None)
+                        GPU_LOCK_HOLDERS.pop(gpu_idx, None)
                         release_local_gpu_lock(gpu_idx)
                     GPU_LOCK_TIMESTAMPS.pop(gpu_idx, None)
 
@@ -735,11 +750,50 @@ def fetch_chunk_meta(peer_host: str, port: int, gpu_index: int) -> dict:
         requests.exceptions.RequestException: On connection or timeout failure.
     """
     url = f"http://{peer_host}:{port}/prepare-chunk?gpu_index={gpu_index}"
-    resp = requests.get(url, timeout=(5, 30))
+    resp = _http_session.get(url, timeout=(0.5, 1))
     if resp.status_code != 200:
         log.error("peer returned HTTP %s: %s", resp.status_code, resp.text)
         resp.raise_for_status()
     return resp.json()
+
+
+# Connection errors that indicate the remote end is simply not reachable
+# right now. These are expected during pod restarts and don't warrant a
+# full stack trace.
+_TRANSIENT_CONN_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+
+
+def _fetch_chunk_meta_with_retry(peer_host, port, gpu_index, peer_name):
+    """Fetch chunk metadata with one explicit retry for transient connection
+    errors. Logs a concise message (no stack trace) for expected errors
+    like ConnectionRefused and NewConnectionError.
+
+    Raises on persistent failure.
+    """
+    for attempt in range(2):
+        try:
+            return fetch_chunk_meta(peer_host, port, gpu_index)
+        except _TRANSIENT_CONN_ERRORS as exc:
+            # Extract the innermost error message, skip the wrapper chain.
+            msg = str(exc)
+            if hasattr(exc, "args") and exc.args:
+                inner = exc.args[0]
+                if hasattr(inner, "reason"):
+                    msg = str(inner.reason)
+            if attempt == 0:
+                log.info("fetch chunk %s gpu %d: %s (retrying)", peer_name,
+                         gpu_index, msg)
+                time.sleep(0.05)
+            else:
+                log.warning("fetch chunk %s gpu %d: %s (giving up)", peer_name,
+                            gpu_index, msg)
+                raise
+        except Exception:
+            log.exception("fetch chunk %s gpu %d failed:", peer_name, gpu_index)
+            raise
 
 
 def import_fabric_handle(handle_bytes: bytes):
@@ -890,26 +944,30 @@ def acquire_gpu_lock_pair(peer_name, peer_host, port, remote_gpu_idx,
         (remote_token, lock_wait_ms): Token for remote unlock, max wait time.
 
     Raises:
-        RuntimeError: If the remote lock HTTP request fails.
-        requests.exceptions.RequestException: On connection/timeout failure.
+        LockError: If the remote lock cannot be acquired.
     """
     my_idx = int(K8S_PODNAME.rsplit("-", 1)[1])
     peer_idx_int = int(peer_name.rsplit("-", 1)[1])
     local_key = (my_idx, local_gpu_idx)
     remote_key = (peer_idx_int, remote_gpu_idx)
 
-    if local_key < remote_key:
-        local_wait = acquire_local_gpu_lock(local_gpu_idx)
-        try:
+    try:
+        if local_key < remote_key:
+            local_wait = acquire_local_gpu_lock(local_gpu_idx)
+            try:
+                remote_token, remote_wait = acquire_remote_gpu_lock(
+                    peer_host, port, remote_gpu_idx)
+            except Exception:
+                release_local_gpu_lock(local_gpu_idx)
+                raise
+        else:
             remote_token, remote_wait = acquire_remote_gpu_lock(
                 peer_host, port, remote_gpu_idx)
-        except Exception:
-            release_local_gpu_lock(local_gpu_idx)
-            raise
-    else:
-        remote_token, remote_wait = acquire_remote_gpu_lock(
-            peer_host, port, remote_gpu_idx)
-        local_wait = acquire_local_gpu_lock(local_gpu_idx)
+            local_wait = acquire_local_gpu_lock(local_gpu_idx)
+    except LockError:
+        raise
+    except Exception as exc:
+        raise LockError(str(exc)) from exc
 
     return remote_token, max(local_wait, remote_wait)
 
@@ -977,10 +1035,9 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
         On failure, result_str is an error tag and timing values are 0.0.
     """
     try:
-        meta = fetch_chunk_meta(peer_host, port, remote_gpu_idx)
+        meta = _fetch_chunk_meta_with_retry(peer_host, port, remote_gpu_idx,
+                                            peer_name)
     except Exception:
-        log.exception("fetch chunk meta from %s gpu %d failed:",
-                      peer_name, remote_gpu_idx)
         return ("req-err", "?", 0.0, 0.0)
 
     peer_node = meta.get("node_name", "?")
@@ -995,6 +1052,10 @@ def import_and_verify_chunk(peer_name: str, peer_host: str, port: int,
         log.exception("CUDA error %s g%d→g%d:", peer_name, remote_gpu_idx,
                       local_gpu_idx)
         return ("cuda-err", peer_node, 0.0, 0.0)
+    except LockError as exc:
+        log.warning("%s g%d→g%d: %s", peer_name, remote_gpu_idx,
+                    local_gpu_idx, exc)
+        return ("lock-err", peer_node, 0.0, 0.0)
     except Exception:
         log.exception("error %s g%d→g%d:", peer_name, remote_gpu_idx,
                       local_gpu_idx)
@@ -1206,26 +1267,30 @@ class HTTPHandler(BaseHTTPRequestHandler):
             return
 
         if "/lock-gpu" in parsed.path:
-            self._handle_lock_gpu(gpu_idx)
+            holder_vals = params.get("holder")
+            holder = holder_vals[0] if holder_vals else self.client_address[0]
+            self._handle_lock_gpu(gpu_idx, holder)
         elif "/unlock-gpu" in parsed.path:
             self._handle_unlock_gpu(gpu_idx, params)
         else:
             self._respond(404, b"unknown path")
 
-    def _handle_lock_gpu(self, gpu_idx):
+    def _handle_lock_gpu(self, gpu_idx, holder):
         """Block until GPU lock is acquired, respond with a lock token."""
         log.debug("HTTPD lock-gpu %d: request from %s, waiting",
-                  gpu_idx, self.client_address[0])
+                  gpu_idx, holder)
         t0 = time.monotonic()
         acquired = GPU_LOCKS[gpu_idx].acquire(timeout=GPU_LOCK_TIMEOUT_S)
         wait_ms = (time.monotonic() - t0) * 1000
 
         if not acquired:
-            self._respond(503, b"lock acquisition timed out")
+            holder = GPU_LOCK_HOLDERS.get(gpu_idx, "unknown")
+            self._respond(503, f"lock acquisition timed out (held by {holder})")
             return
 
         log.debug("HTTPD lock-gpu %d: granted to %s after %.1f ms",
-                  gpu_idx, self.client_address[0], wait_ms)
+                  gpu_idx, holder, wait_ms)
+        GPU_LOCK_HOLDERS[gpu_idx] = holder
         token = uuid.uuid4().hex[:12]
         GPU_LOCK_TOKENS[gpu_idx] = token
         GPU_LOCK_TIMESTAMPS[gpu_idx] = time.monotonic()
@@ -1310,8 +1375,18 @@ def log_device_properties():
 
 
 
-class CudaError(RuntimeError):
+class AtackError(Exception):
+    """Base exception for atack application errors."""
+    pass
+
+
+class CudaError(AtackError):
     """Raised by checkCudaErrors() for CUDA API failures."""
+    pass
+
+
+class LockError(AtackError):
+    """Raised when GPU lock acquisition fails (timeout, connection error)."""
     pass
 
 
