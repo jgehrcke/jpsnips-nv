@@ -108,8 +108,8 @@ def cuda_cleanup():
         try:
             ensure_cuda_context(gpu_idx)
             driver.cuMemUnmap(va_ptr, alloc_size)
-            driver.cuMemAddressFree(va_ptr, alloc_size)
             driver.cuMemRelease(alloc_handle)
+            driver.cuMemAddressFree(va_ptr, alloc_size)
             pop_cuda_context()
         except Exception as exc:
             log.warning("cuda_cleanup: GPU %d shared chunk: %s", gpu_idx, exc)
@@ -706,11 +706,14 @@ def unmap_imported_chunk(va_ptr, alloc_size: int, alloc_handle):
     Raises:
         CudaError: On unmap, address free, or release failure.
     """
+    # Order: unmap → release physical handle → free VA range.
+    # Must unmap before release, per CUDA driver API contract.
     if va_ptr is not None:
         checkCudaErrors(driver.cuMemUnmap(va_ptr, alloc_size))
-        checkCudaErrors(driver.cuMemAddressFree(va_ptr, alloc_size))
     if alloc_handle is not None:
         checkCudaErrors(driver.cuMemRelease(alloc_handle))
+    if va_ptr is not None:
+        checkCudaErrors(driver.cuMemAddressFree(va_ptr, alloc_size))
 
 
 def acquire_gpu_lock_pair(peer_name, peer_host, port, remote_gpu_idx,
