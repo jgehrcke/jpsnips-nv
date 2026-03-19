@@ -1449,7 +1449,7 @@ def _benchmark_one_peer(pod_name, peer_host, port, peer_metas):
     ]
     random.shuffle(work_items)
 
-    results = {}
+    results = []
     max_lock_wait_ms = 0.0
     benchmark_durations = []
 
@@ -1468,8 +1468,13 @@ def _benchmark_one_peer(pod_name, peer_host, port, peer_metas):
         max_lock_wait_ms = max(max_lock_wait_ms, lock_wait)
         if bench_ms > 0:
             benchmark_durations.append(bench_ms)
-        key = f"{peer_idx}@{peer_node}-g{remote_gpu_idx}-g{local_gpu_idx}"
-        results[key] = status
+        results.append({
+            "peer_idx": peer_idx,
+            "peer_node": peer_node,
+            "remote_gpu": remote_gpu_idx,
+            "local_gpu": local_gpu_idx,
+            "value": status,
+        })
 
     return results, max_lock_wait_ms, benchmark_durations
 
@@ -1517,7 +1522,7 @@ def _run_one_poll_round():
 
     # Benchmark all peers in parallel — one thread per peer.
     # Local GPU locks handle contention for shared local GPUs.
-    results = {}
+    results = []
     max_lock_wait_ms = 0.0
     benchmark_durations = []
 
@@ -1533,7 +1538,7 @@ def _run_one_poll_round():
             pod_name = futures[future]
             try:
                 peer_results, peer_lock_wait, peer_durations = future.result()
-                results.update(peer_results)
+                results.extend(peer_results)
                 max_lock_wait_ms = max(max_lock_wait_ms, peer_lock_wait)
                 benchmark_durations.extend(peer_durations)
             except Exception:
@@ -1549,7 +1554,8 @@ def _run_one_poll_round():
     # If the entire round completed without any CUDA errors, clear the
     # fatal flag. This restores liveness after a transient ILLEGAL_STATE.
     _error_tags = ("err", "ILLEGAL_STATE", "INVALID_HANDLE", "LAUNCH_FAILED", "MISMATCH", "lock-err")
-    has_errors = any(any(tag in v for tag in _error_tags) for v in results.values())
+    has_errors = any(any(tag in b["value"] for tag in _error_tags)
+                     for b in results)
     if not has_errors and FATAL_CUDA_ERROR is not None:
         log.info("LIVENESS FLIP failing→healthy: round completed without "
                  "errors, clearing FATAL_CUDA_ERROR (was: %s)", FATAL_CUDA_ERROR)
@@ -1560,14 +1566,19 @@ def _run_one_poll_round():
     round_dur = time.monotonic() - round_t0
 
     # Append to ring buffer for /results endpoint.
-    ok_count = sum(1 for v in results.values()
-                   if not any(tag in v for tag in _error_tags))
+    # Add combined key to each entry for convenience.
+    for b in results:
+        b["key"] = (f"{b['peer_idx']}@{b['peer_node']}"
+                    f"-g{b['remote_gpu']}-g{b['local_gpu']}")
+    ok_count = sum(1 for b in results
+                   if not any(tag in b["value"] for tag in _error_tags))
+    benchmarks_sorted = sorted(results, key=lambda b: b["key"])
     RESULTS_RING.append({
         "timestamp": datetime.datetime.now(datetime.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "_monotonic": time.monotonic(),  # For server-side age computation.
         "round_time_s": round(round_dur, 2),
-        "benchmarks": dict(sorted(results.items())),
+        "benchmarks": benchmarks_sorted,
         "total": len(results),
         "ok": ok_count,
         "errors": len(results) - ok_count,
@@ -1575,7 +1586,7 @@ def _run_one_poll_round():
     if len(RESULTS_RING) > RESULTS_RING_MAX:
         RESULTS_RING[:] = RESULTS_RING[-RESULTS_RING_MAX:]
     my_idx = K8S_PODNAME.rsplit("-", 1)[1]
-    parts = [f"{k}:{v}" for k, v in sorted(results.items())]
+    parts = [f"{b['key']}:{b['value']}" for b in benchmarks_sorted]
     log.info("result(%s@%s): round_time=%.1fs %s",
              my_idx, K8S_NODENAME, round_dur, " ".join(parts))
 
