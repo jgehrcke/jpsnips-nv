@@ -48,6 +48,12 @@ read -r
 
 set -x
 kubectl cordon "${TARGET_NODE}"
+set +x
+
+# Uncordon on any exit (success, error, Ctrl+C).
+trap 'echo ""; echo "Uncordoning ${TARGET_NODE}"; kubectl uncordon "${TARGET_NODE}"' EXIT
+
+set -x
 kubectl drain "${TARGET_NODE}" --ignore-daemonsets --delete-emptydir-data --timeout=60s
 set +x
 
@@ -75,5 +81,3 @@ done
 echo ""
 echo "Node replacement complete: ${TARGET_POD} now on ${NODE}"
 kubectl get pods -l app=atack -o wide
-echo ""
-echo "To restore: kubectl uncordon ${TARGET_NODE}"
