@@ -78,12 +78,11 @@ import collections
 import concurrent.futures
 import ctypes
 import datetime
+import itertools
 import json
-
-import orjson
-import random
 import logging
 import os
+import random
 import signal
 import socket
 import struct
@@ -96,6 +95,7 @@ from pprint import pformat
 from urllib.parse import urlparse, parse_qs
 
 import dns.resolver
+import orjson
 import requests
 from requests.adapters import HTTPAdapter
 
@@ -1398,6 +1398,17 @@ def _evict_stale_cache_entries(active_handle_bytes):
         log.info("evicted %d stale import cache entries", len(stale_keys))
 
 
+def _evict_import_on_error(local_gpu_idx, handle_bytes):
+    """Evict import cache entry on error -- the handle may be stale."""
+    evicted = IMPORT_CACHE.pop((local_gpu_idx, handle_bytes), None)
+    if evicted is None:
+        return
+    try:
+        unmap_imported_chunk(evicted[1], evicted[2], evicted[0])
+    except Exception:
+        log.warning("failed to unmap evicted import for GPU %d", local_gpu_idx)
+
+
 def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
                           handle_bytes, alloc_size, num_floats, float_value):
     """Import a remote fabric handle, map it, acquire GPU locks, run benchmark.
@@ -1420,8 +1431,7 @@ def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
     t_total = time.monotonic()
 
     ensure_cuda_context(local_gpu_idx)
-
-    remote_token = None
+    locks_held = False
 
     try:
         t0 = time.monotonic()
@@ -1431,28 +1441,21 @@ def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
 
         remote_token, lock_wait_ms = acquire_gpu_lock_pair(
             peer_name, peer_host, port, remote_gpu_idx, local_gpu_idx)
-        try:
-            result, benchmark_ms = verify_chunk_on_gpu(
-                local_gpu_idx, va_ptr, alloc_size, num_floats, float_value)
-        finally:
+        locks_held = True
+
+        result, benchmark_ms = verify_chunk_on_gpu(
+            local_gpu_idx, va_ptr, alloc_size, num_floats, float_value)
+    except Exception:
+        _evict_import_on_error(local_gpu_idx, handle_bytes)
+        raise
+    finally:
+        if locks_held:
             t0 = time.monotonic()
             release_local_gpu_lock(local_gpu_idx)
             release_remote_gpu_lock(peer_host, port, remote_gpu_idx,
                                     remote_token)
             unlock_ms = (time.monotonic() - t0) * 1000
-    except Exception:
-        # On error, evict this cache entry — the handle may be stale.
-        cache_key = (local_gpu_idx, handle_bytes)
-        evicted = IMPORT_CACHE.pop(cache_key, None)
-        if evicted:
-            try:
-                unmap_imported_chunk(evicted[1], evicted[2], evicted[0])
-            except Exception:
-                pass
         pop_cuda_context()
-        raise
-
-    pop_cuda_context()
 
     total_ms = (time.monotonic() - t_total) * 1000
     log.debug("phases: import+map=%.1f%s lock_wait=%.1f DtoD=%.1f "
@@ -1562,10 +1565,8 @@ def _benchmark_one_peer(pod_name, peer_host, port, peer_metas):
         return [], 0.0, []
 
     peer_idx = pod_name.rsplit("-", 1)[1]
-    work_items = [
-        (rg, lg) for rg in range(GPUS_PER_NODE)
-        for lg in range(GPUS_PER_NODE)
-    ]
+    gpu_range = range(GPUS_PER_NODE)
+    work_items = list(itertools.product(gpu_range, gpu_range))
     random.shuffle(work_items)
 
     results = []
@@ -1657,17 +1658,18 @@ def _run_one_poll_round():
     round_mono = time.monotonic()
 
     # Emit error entries for unreachable peers.
+    gpu_range = range(GPUS_PER_NODE)
+    gpu_pairs = list(itertools.product(gpu_range, gpu_range))
     for pod_name, error_tag in unreachable_peers.items():
         peer_idx = pod_name.rsplit("-", 1)[1]
-        for rg in range(GPUS_PER_NODE):
-            for lg in range(GPUS_PER_NODE):
-                results.append({
-                    "peer_idx": peer_idx,
-                    "peer_node": "?",
-                    "remote_gpu": rg,
-                    "local_gpu": lg,
-                    "value": error_tag,
-                })
+        for rg, lg in gpu_pairs:
+            results.append({
+                "peer_idx": peer_idx,
+                "peer_node": "?",
+                "remote_gpu": rg,
+                "local_gpu": lg,
+                "value": error_tag,
+            })
 
     reachable_peers = [(pn, ph) for pn, ph in peers if pn in peer_metas]
     with concurrent.futures.ThreadPoolExecutor(
@@ -1831,16 +1833,17 @@ class HTTPHandler(BaseHTTPRequestHandler):
         if "/healthz" in self.path:
             if FATAL_CUDA_ERROR:
                 self._respond(500, f"fatal: {FATAL_CUDA_ERROR}")
-            elif LAST_RESULT_TIME is not None:
-                age = time.monotonic() - LAST_RESULT_TIME
-                max_age = POLL_INTERVAL_S * 3
-                if age > max_age:
-                    self._respond(500,
-                        f"stale: no result for {age:.0f}s (max {max_age}s)")
-                else:
-                    self._respond(200, b"ok")
+                return
+            if LAST_RESULT_TIME is None:
+                # No result yet (startup) -- healthy, give it time.
+                self._respond(200, b"ok")
+                return
+            age = time.monotonic() - LAST_RESULT_TIME
+            max_age = POLL_INTERVAL_S * 3
+            if age > max_age:
+                self._respond(500,
+                    f"stale: no result for {age:.0f}s (max {max_age}s)")
             else:
-                # No result yet (startup) — healthy, give it time.
                 self._respond(200, b"ok")
             return
 
@@ -2013,16 +2016,15 @@ def log_device_properties():
 
         printprops = {}
         for k in dir(props):
+            if not any(k.startswith(prefix) for prefix in _attr_filter):
+                continue
             v = getattr(props, k)
-            for ss in _attr_filter:
-                if k.startswith(ss):
-                    if k == "uuid":
-                        try:
-                            v = uuid.UUID(bytes=v.bytes)
-                        except ValueError:
-                            log.warning("funky UUID bytes: %s", v.bytes)
-                    printprops[k] = v
-                    break
+            if k == "uuid":
+                try:
+                    v = uuid.UUID(bytes=v.bytes)
+                except ValueError:
+                    log.warning("unexpected UUID bytes: %s", v.bytes)
+            printprops[k] = v
 
         log.info("GPU %d properties:\n%s", gpu_idx, pformat(printprops))
         pop_cuda_context()
