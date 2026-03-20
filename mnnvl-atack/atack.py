@@ -237,10 +237,12 @@ VERIFY_PARTIALS_BUFS = {}    # {gpu_idx: CUdeviceptr}
 # When set, /healthz returns 500 to fail the liveness probe.
 FATAL_CUDA_ERROR = None
 
-# Timestamp of last successful result emission. The /healthz endpoint
-# returns 500 if no result was produced within 3× the poll interval,
-# indicating the pod is stuck (hung CUDA call, dead thread, etc.).
-LAST_RESULT_TIME = None       # Set after ANY round (even partial).
+# Monotonic time when the poll loop last completed a round (including
+# rounds with errors or no peers). "Completed" means _run_one_poll_round
+# returned normally, not that all benchmarks succeeded. Used by /healthz:
+# if no round completed within 3x POLL_INTERVAL_S the pod is considered
+# stuck and the liveness probe fails.
+LAST_RESULT_TIME = None
 
 # Recent round results for the /results endpoint.
 # Deque of completed results, most recent last.
