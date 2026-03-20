@@ -1661,7 +1661,7 @@ def _run_one_poll_round():
             unreachable_peers[pod_name] = "unreachable"
         except Exception:
             log.exception("failed to prefetch chunk metas from %s:", pod_name)
-            unreachable_peers[pod_name] = "prefetch-err"
+            unreachable_peers[pod_name] = "handle-fetch-err"
 
     if not peer_metas and not unreachable_peers:
         return
@@ -1680,7 +1680,7 @@ def _run_one_poll_round():
     benchmark_durations = []
 
     _error_tags = ("err", "ILLEGAL_STATE", "INVALID_HANDLE", "LAUNCH_FAILED",
-                   "MISMATCH", "lock-err", "unreachable", "prefetch-err")
+                   "MISMATCH", "lock-err", "unreachable", "handle-fetch-err")
 
     round_ts = (datetime.datetime.now(datetime.timezone.utc)
                 .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
