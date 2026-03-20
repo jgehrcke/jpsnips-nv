@@ -1803,10 +1803,19 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def _respond(self, code, body):
         """Send an HTTP response. Accepts str or bytes body."""
-        self.send_response(code)
-        self.end_headers()
         if isinstance(body, str):
             body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _respond_json(self, body):
+        """Send a 200 JSON response. body must be bytes."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
         self.wfile.write(body)
 
     def _parse_gpu_index(self):
@@ -1846,10 +1855,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 "fatal_cuda_error": FATAL_CUDA_ERROR,
                 "shutting_down": SHUTTING_DOWN.is_set(),
             })
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(body)
+            self._respond_json(body)
             return
 
         if "/readyz" in self.path:
@@ -1904,10 +1910,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         pop_cuda_context()
         LAST_CHUNK_SERVED_TIME[gpu_idx] = time.monotonic()
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(body)
+        self._respond_json(body)
 
     def do_POST(self):
         parsed = urlparse(self.path)
