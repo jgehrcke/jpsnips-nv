@@ -101,6 +101,24 @@ from requests.adapters import HTTPAdapter
 
 from cuda.bindings import driver, runtime, nvrtc
 
+
+class AtackError(Exception):
+    """Base exception for atack application errors."""
+
+
+class CudaError(AtackError):
+    """Raised by cucheck() for CUDA API failures."""
+
+
+class LockError(AtackError):
+    """Raised when GPU lock acquisition fails (timeout, connection error)."""
+
+
+class PeerUnreachableError(AtackError):
+    """Raised when a peer pod cannot be reached (DNS failure, connection refused).
+    The caller should skip all remaining GPU pairs for this peer."""
+
+
 log = logging.getLogger()
 logging.Formatter.converter = time.gmtime
 logging.basicConfig(
@@ -109,8 +127,57 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 
-# HTTP session with limited retries. urllib3 defaults to aggressive retries
-# on DNS failures which blocks the poll loop. Allow at most 1 retry.
+# Fatal CUDA error codes: unrecoverable GPU/context corruption.
+_FATAL_CUDA_CODES = (
+    driver.CUresult.CUDA_ERROR_ILLEGAL_STATE,
+    driver.CUresult.CUDA_ERROR_LAUNCH_FAILED,
+)
+
+
+def _cuda_get_error_name(error):
+    """Get human-readable name for a CUDA or NVRTC error code."""
+    if isinstance(error, driver.CUresult):
+        err, name = driver.cuGetErrorName(error)
+        return name if err == driver.CUresult.CUDA_SUCCESS else "<unknown>"
+    elif isinstance(error, nvrtc.nvrtcResult):
+        return nvrtc.nvrtcGetErrorString(error)[1]
+    else:
+        raise RuntimeError(f"Unknown error type: {error}")
+
+
+def cucheck(result):
+    """Unwrap a CUDA driver API result tuple.
+
+    Raises CudaError if the status code indicates failure. Sets
+    FATAL_CUDA_ERROR for unrecoverable errors (ILLEGAL_STATE,
+    LAUNCH_FAILED) so /healthz returns 500.
+
+    On success, returns the payload value(s) or None.
+    """
+    global FATAL_CUDA_ERROR
+    if result[0].value:
+        error_name = _cuda_get_error_name(result[0])
+        error_msg = f"CUDA error code={result[0].value}({error_name})"
+
+        if result[0] in _FATAL_CUDA_CODES:
+            was_healthy = FATAL_CUDA_ERROR is None
+            FATAL_CUDA_ERROR = error_msg
+            if was_healthy:
+                log.error("fatal CUDA error, setting FATAL_CUDA_ERROR: %s "
+                          "(/healthz will return 500)", error_msg)
+            else:
+                log.error("fatal CUDA error (FATAL_CUDA_ERROR already set): "
+                          "%s", error_msg)
+
+        raise CudaError(error_msg)
+    if len(result) == 1:
+        return None
+    elif len(result) == 2:
+        return result[1]
+    else:
+        return result[1:]
+
+
 # HTTP session with no internal retries. Retrying is done explicitly
 # in the calling code where we can control timing and log level.
 _http_session = requests.Session()
@@ -145,9 +212,6 @@ SHARED_CHUNK_STATIC_META = {}    # {gpu_idx: dict (without handle field)}
 LAST_EXPORTED_HANDLE_BYTES = {}  # {gpu_idx: bytes} — for detecting identical re-exports
 LAST_CHUNK_SERVED_TIME = {}     # {gpu_idx: monotonic} — when /prepare-chunk last served this GPU
 
-# Pre-allocated GPU buffers for verify_chunk_on_gpu(), per GPU.
-# Eliminates per-round cuMemAlloc/cuMemFree churn which may contribute to
-# bandwidth measurement variance we observed.
 # Per-GPU locks to ensure exclusive HBM access during bandwidth measurement.
 # A GPU's HBM is shared between local DtoD writes (receiving data) and remote
 # DtoD reads (serving data to other pods). Without coordination, concurrent
@@ -163,16 +227,15 @@ GPU_LOCK_TIMESTAMPS = {} # {gpu_idx: monotonic time of last acquire}
 GPU_LOCK_TOKENS = {}     # {gpu_idx: str} — token identifying current lock holder
 GPU_LOCK_HOLDERS = {}    # {gpu_idx: str} — who holds the lock (IP or "local")
 
+# Pre-allocated GPU buffers for verify_chunk_on_gpu(), per GPU.
+# Avoids per-round cuMemAlloc/cuMemFree churn.
 VERIFY_LOCAL_BUFS = {}       # {gpu_idx: CUdeviceptr}
 VERIFY_LOCAL_BUF_SIZES = {}  # {gpu_idx: int}
 VERIFY_PARTIALS_BUFS = {}    # {gpu_idx: CUdeviceptr}
 
-# Fatal CUDA error tracking. When set, the /healthz endpoint returns 500
-# to fail the liveness probe, causing kubelet to replace the pod (not just
-# restart the container). A new pod triggers fresh IMEX daemon resource
-# claims. This is specifically for CUDA_ERROR_ILLEGAL_STATE which indicates
-# unrecoverable GPU state corruption.
-FATAL_CUDA_ERROR = None  # Set to error string on fatal error
+# Set to error string by cucheck() on fatal CUDA errors.
+# When set, /healthz returns 500 to fail the liveness probe.
+FATAL_CUDA_ERROR = None
 
 # Timestamp of last successful result emission. The /healthz endpoint
 # returns 500 if no result was produced within 3× the poll interval,
@@ -181,7 +244,6 @@ LAST_RESULT_TIME = None       # Set after ANY round (even partial).
 
 # Recent round results for the /results endpoint.
 # Deque of completed results, most recent last.
-# In-progress round is updated incrementally as each peer completes.
 RESULTS_HISTORY_MAX = 5
 RESULTS_HISTORY = collections.deque(maxlen=RESULTS_HISTORY_MAX)
 
@@ -308,10 +370,10 @@ def main():
              HTTPD_PORT, CHUNK_MIB, FLOAT_VALUE, SVC_NAME, POLL_INTERVAL_S,
              GPUS_PER_NODE)
 
-    log.info("cuDriverGetVersion(): %s", checkCudaErrors(driver.cuDriverGetVersion()))
+    log.info("cuDriverGetVersion(): %s", cucheck(driver.cuDriverGetVersion()))
     log.info(
         "getLocalRuntimeVersion(): %s",
-        checkCudaErrors(runtime.getLocalRuntimeVersion()),
+        cucheck(runtime.getLocalRuntimeVersion()),
     )
 
     for k, v in os.environ.items():
@@ -388,24 +450,24 @@ def cuda_init():
         CudaError: On any CUDA API failure.
         AssertionError: If fewer devices are visible than GPUS_PER_NODE.
     """
-    checkCudaErrors(driver.cuInit(0))
+    cucheck(driver.cuInit(0))
 
-    devcount = checkCudaErrors(runtime.cudaGetDeviceCount())
+    devcount = cucheck(runtime.cudaGetDeviceCount())
     log.info("cudaGetDeviceCount(): %s, GPUS_PER_NODE: %s", devcount, GPUS_PER_NODE)
     assert devcount >= GPUS_PER_NODE, \
         f"GPUS_PER_NODE={GPUS_PER_NODE} but only {devcount} devices visible"
 
     for gpu_idx in range(GPUS_PER_NODE):
-        cudev = checkCudaErrors(driver.cuDeviceGet(gpu_idx))
+        cudev = cucheck(driver.cuDeviceGet(gpu_idx))
         CUDEVS[gpu_idx] = cudev
         log.info("GPU %d: cudev=%s", gpu_idx, cudev)
 
         # Each GPU has its own primary context.
-        ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(cudev))
-        checkCudaErrors(driver.cuCtxPushCurrent(ctx))
+        ctx = cucheck(driver.cuDevicePrimaryCtxRetain(cudev))
+        cucheck(driver.cuCtxPushCurrent(ctx))
         log.info("GPU %d: retained and pushed primary context: %s", gpu_idx, ctx)
 
-        vaddr_supported = checkCudaErrors(
+        vaddr_supported = cucheck(
             driver.cuDeviceGetAttribute(
                 driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED,
                 cudev,
@@ -414,7 +476,7 @@ def cuda_init():
         if not vaddr_supported:
             raise Exception(f"GPU {gpu_idx}: VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED: false")
 
-        sm_count = checkCudaErrors(
+        sm_count = cucheck(
             driver.cuDeviceGetAttribute(
                 driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
                 cudev,
@@ -435,7 +497,7 @@ def cuda_init():
         prop.location.id = gpu_idx
         ALLOC_PROPS[gpu_idx] = prop
 
-        GRANULARITIES[gpu_idx] = checkCudaErrors(
+        GRANULARITIES[gpu_idx] = cucheck(
             driver.cuMemGetAllocationGranularity(
                 prop,
                 driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
@@ -450,7 +512,7 @@ def cuda_init():
         preallocate_verify_buffers(gpu_idx)
 
         # Pop context — we'll push per-GPU as needed.
-        checkCudaErrors(driver.cuCtxPopCurrent())
+        cucheck(driver.cuCtxPopCurrent())
 
 
 # CUDA kernel that sums all float32 values in the input array.
@@ -534,8 +596,8 @@ def compile_checksum_kernel(gpu_idx):
     ptx = b" " * ptx_size
     check_nvrtc_errors(nvrtc.nvrtcGetPTX(prog, ptx))
 
-    module = checkCudaErrors(driver.cuModuleLoadData(ptx))
-    CHECKSUM_KERNELS[gpu_idx] = checkCudaErrors(
+    module = cucheck(driver.cuModuleLoadData(ptx))
+    CHECKSUM_KERNELS[gpu_idx] = cucheck(
         driver.cuModuleGetFunction(module, b"checksum"))
     log.info("GPU %d: compiled and loaded checksum kernel", gpu_idx)
 
@@ -555,11 +617,11 @@ def preallocate_verify_buffers(gpu_idx):
     chunk_bytes = CHUNK_MIB * 1024 * 1024
     granularity = GRANULARITIES[gpu_idx]
     alloc_size = ((chunk_bytes + granularity - 1) // granularity) * granularity
-    VERIFY_LOCAL_BUFS[gpu_idx] = checkCudaErrors(driver.cuMemAlloc(alloc_size))
+    VERIFY_LOCAL_BUFS[gpu_idx] = cucheck(driver.cuMemAlloc(alloc_size))
     VERIFY_LOCAL_BUF_SIZES[gpu_idx] = alloc_size
 
     partials_size = CHECKSUM_NUM_BLOCKS[gpu_idx] * ctypes.sizeof(ctypes.c_double)
-    VERIFY_PARTIALS_BUFS[gpu_idx] = checkCudaErrors(driver.cuMemAlloc(partials_size))
+    VERIFY_PARTIALS_BUFS[gpu_idx] = cucheck(driver.cuMemAlloc(partials_size))
 
     log.info("GPU %d: pre-allocated verify buffers: local_buf=%d bytes, partials=%d bytes",
              gpu_idx, alloc_size, partials_size)
@@ -586,8 +648,8 @@ def ensure_cuda_context(gpu_idx):
     Raises:
         CudaError: If the context cannot be retained or pushed.
     """
-    ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(CUDEVS[gpu_idx]))
-    checkCudaErrors(driver.cuCtxPushCurrent(ctx))
+    ctx = cucheck(driver.cuDevicePrimaryCtxRetain(CUDEVS[gpu_idx]))
+    cucheck(driver.cuCtxPushCurrent(ctx))
 
 
 def pop_cuda_context():
@@ -596,7 +658,7 @@ def pop_cuda_context():
     Raises:
         CudaError: If no context is active on this thread.
     """
-    checkCudaErrors(driver.cuCtxPopCurrent())
+    cucheck(driver.cuCtxPopCurrent())
 
 
 def acquire_local_gpu_lock(gpu_idx) -> float:
@@ -780,7 +842,6 @@ def start_gpu_lock_watchdog():
     t.start()
 
 
-
 def prepare_all_shared_chunks():
     """Allocate, fill, and export a fabric handle on each local GPU.
 
@@ -794,7 +855,6 @@ def prepare_all_shared_chunks():
         ensure_cuda_context(gpu_idx)
         _prepare_shared_chunk_for_gpu(gpu_idx)
         pop_cuda_context()
-
 
 
 def _free_retired_chunks(gpu_idx):
@@ -924,21 +984,21 @@ def _prepare_shared_chunk_for_gpu(gpu_idx):
     log.info("GPU %d: cuMemCreate(%d MiB) starting", gpu_idx,
              alloc_size // (1024 * 1024))
     t0 = time.monotonic()
-    alloc_handle = checkCudaErrors(
+    alloc_handle = cucheck(
         driver.cuMemCreate(alloc_size, ALLOC_PROPS[gpu_idx], 0))
     create_ms = (time.monotonic() - t0) * 1000
     if create_ms > 100:
         log.warning("GPU %d: cuMemCreate took %.1fs", gpu_idx, create_ms / 1000)
 
     t0 = time.monotonic()
-    va_ptr = checkCudaErrors(
+    va_ptr = cucheck(
         driver.cuMemAddressReserve(alloc_size, granularity, 0, 0))
-    checkCudaErrors(driver.cuMemMap(va_ptr, alloc_size, 0, alloc_handle, 0))
+    cucheck(driver.cuMemMap(va_ptr, alloc_size, 0, alloc_handle, 0))
 
     access_desc = driver.CUmemAccessDesc()
     access_desc.location = ALLOC_PROPS[gpu_idx].location
     access_desc.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-    checkCudaErrors(driver.cuMemSetAccess(va_ptr, alloc_size, [access_desc], 1))
+    cucheck(driver.cuMemSetAccess(va_ptr, alloc_size, [access_desc], 1))
     map_ms = (time.monotonic() - t0) * 1000
     if map_ms > 100:
         log.warning("GPU %d: reserve+map+access took %.1fs", gpu_idx, map_ms / 1000)
@@ -948,9 +1008,9 @@ def _prepare_shared_chunk_for_gpu(gpu_idx):
     # float32's bit pattern via struct pack/unpack.
     t0 = time.monotonic()
     float_as_uint32 = struct.unpack("I", struct.pack("f", FLOAT_VALUE))[0]
-    checkCudaErrors(driver.cuMemsetD32(va_ptr, float_as_uint32, num_floats))
+    cucheck(driver.cuMemsetD32(va_ptr, float_as_uint32, num_floats))
     # cuMemsetD32 is asynchronous — wait for completion.
-    checkCudaErrors(driver.cuCtxSynchronize())
+    cucheck(driver.cuCtxSynchronize())
     fill_ms = (time.monotonic() - t0) * 1000
     if fill_ms > 100:
         log.warning("GPU %d: memset+sync took %.1fs", gpu_idx, fill_ms / 1000)
@@ -985,7 +1045,7 @@ def export_fabric_handle_for_gpu(gpu_idx) -> bytes:
         CudaError: If cuMemExportToShareableHandle fails.
     """
     t0 = time.monotonic()
-    fabric_handle = checkCudaErrors(
+    fabric_handle = cucheck(
         driver.cuMemExportToShareableHandle(
             SHARED_CHUNK_ALLOC_HANDLES[gpu_idx],
             driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
@@ -1083,7 +1143,7 @@ def import_fabric_handle(handle_bytes: bytes):
     Raises:
         CudaError: If the handle cannot be imported.
     """
-    return checkCudaErrors(
+    return cucheck(
         driver.cuMemImportFromShareableHandle(
             handle_bytes,
             driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
@@ -1098,17 +1158,16 @@ def map_imported_chunk(alloc_handle, alloc_size: int, gpu_idx: int) -> int:
         CudaError: On address reservation, mapping, or access control failure.
     """
     granularity = GRANULARITIES[gpu_idx]
-    va_ptr = checkCudaErrors(
+    va_ptr = cucheck(
         driver.cuMemAddressReserve(alloc_size, granularity, 0, 0)
     )
-    checkCudaErrors(driver.cuMemMap(va_ptr, alloc_size, 0, alloc_handle, 0))
+    cucheck(driver.cuMemMap(va_ptr, alloc_size, 0, alloc_handle, 0))
 
     access_desc = driver.CUmemAccessDesc()
     access_desc.location = ALLOC_PROPS[gpu_idx].location
     access_desc.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-    checkCudaErrors(driver.cuMemSetAccess(va_ptr, alloc_size, [access_desc], 1))
+    cucheck(driver.cuMemSetAccess(va_ptr, alloc_size, [access_desc], 1))
     return va_ptr
-
 
 
 def verify_chunk_on_gpu(local_gpu_idx: int, va_ptr: int, alloc_size: int,
@@ -1138,17 +1197,17 @@ def verify_chunk_on_gpu(local_gpu_idx: int, va_ptr: int, alloc_size: int,
         f"chunk {alloc_size} exceeds pre-allocated buffer {VERIFY_LOCAL_BUF_SIZES[local_gpu_idx]}"
 
     # Phase 1: time the DtoD copy (pure NVLink transfer).
-    ev_start = checkCudaErrors(driver.cuEventCreate(0))
-    ev_end = checkCudaErrors(driver.cuEventCreate(0))
+    ev_start = cucheck(driver.cuEventCreate(0))
+    ev_end = cucheck(driver.cuEventCreate(0))
 
-    checkCudaErrors(driver.cuEventRecord(ev_start, 0))
-    checkCudaErrors(driver.cuMemcpyDtoD(local_buf, va_ptr, alloc_size))
-    checkCudaErrors(driver.cuEventRecord(ev_end, 0))
-    checkCudaErrors(driver.cuEventSynchronize(ev_end))
+    cucheck(driver.cuEventRecord(ev_start, 0))
+    cucheck(driver.cuMemcpyDtoD(local_buf, va_ptr, alloc_size))
+    cucheck(driver.cuEventRecord(ev_end, 0))
+    cucheck(driver.cuEventSynchronize(ev_end))
 
-    elapsed_ms = checkCudaErrors(driver.cuEventElapsedTime(ev_start, ev_end))
-    checkCudaErrors(driver.cuEventDestroy(ev_start))
-    checkCudaErrors(driver.cuEventDestroy(ev_end))
+    elapsed_ms = cucheck(driver.cuEventElapsedTime(ev_start, ev_end))
+    cucheck(driver.cuEventDestroy(ev_start))
+    cucheck(driver.cuEventDestroy(ev_end))
 
     # Phase 2: checksum the local copy for data integrity.
     num_blocks = CHECKSUM_NUM_BLOCKS[local_gpu_idx]
@@ -1164,17 +1223,17 @@ def verify_chunk_on_gpu(local_gpu_idx: int, va_ptr: int, alloc_size: int,
         ctypes.addressof(out_ptr_arg),
     )
 
-    checkCudaErrors(driver.cuLaunchKernel(
+    cucheck(driver.cuLaunchKernel(
         CHECKSUM_KERNELS[local_gpu_idx],
         num_blocks, 1, 1,
         256, 1, 1,
         0, 0,
         args, 0,
     ))
-    checkCudaErrors(driver.cuCtxSynchronize())
+    cucheck(driver.cuCtxSynchronize())
 
     result_buf = bytearray(out_size)
-    checkCudaErrors(driver.cuMemcpyDtoH(result_buf, partials_buf, out_size))
+    cucheck(driver.cuMemcpyDtoH(result_buf, partials_buf, out_size))
 
     partial_sums = struct.unpack(f"{num_blocks}d", result_buf)
     gpu_sum = sum(partial_sums)
@@ -1203,14 +1262,14 @@ def unmap_imported_chunk(va_ptr, alloc_size: int, alloc_handle):
     Raises:
         CudaError: On unmap, address free, or release failure.
     """
-    # Order: unmap → release physical handle → free VA range.
+    # Order: unmap, release physical handle, free VA range.
     # Must unmap before release, per CUDA driver API contract.
     if va_ptr is not None:
-        checkCudaErrors(driver.cuMemUnmap(va_ptr, alloc_size))
+        cucheck(driver.cuMemUnmap(va_ptr, alloc_size))
     if alloc_handle is not None:
-        checkCudaErrors(driver.cuMemRelease(alloc_handle))
+        cucheck(driver.cuMemRelease(alloc_handle))
     if va_ptr is not None:
-        checkCudaErrors(driver.cuMemAddressFree(va_ptr, alloc_size))
+        cucheck(driver.cuMemAddressFree(va_ptr, alloc_size))
 
 
 def evict_peer_imports(peer_pod_name):
@@ -1407,7 +1466,7 @@ def _run_single_benchmark(peer_name: str, peer_host: str, port: int,
             handle_bytes, meta["alloc_size"], meta["num_floats"],
             meta["float_value"])
     except CudaError as exc:
-        log.exception("CUDA error %s g%d→g%d:", peer_name, remote_gpu_idx,
+        log.exception("CUDA error %s g%d->g%d:", peer_name, remote_gpu_idx,
                       local_gpu_idx)
         # Include specific CUDA error in result for dashboard display.
         # e.g. "INVALID_HANDLE" from "CUDA error code=400(b'CUDA_ERROR_INVALID_HANDLE')"
@@ -1421,11 +1480,11 @@ def _run_single_benchmark(peer_name: str, peer_host: str, port: int,
             tag = "LAUNCH_FAILED"
         return (tag, peer_node, 0.0, 0.0)
     except LockError as exc:
-        log.warning("%s g%d→g%d: %s", peer_name, remote_gpu_idx,
+        log.warning("%s g%d->g%d: %s", peer_name, remote_gpu_idx,
                     local_gpu_idx, exc)
         return ("lock-err", peer_node, 0.0, 0.0)
     except Exception:
-        log.exception("error %s g%d→g%d:", peer_name, remote_gpu_idx,
+        log.exception("error %s g%d->g%d:", peer_name, remote_gpu_idx,
                       local_gpu_idx)
         return ("err", peer_node, 0.0, 0.0)
 
@@ -1474,11 +1533,11 @@ def _prefetch_peer_chunk_metas(peer_name, peer_host, port):
 def _benchmark_one_peer(pod_name, peer_host, port, peer_metas):
     """Run all GPU-pair benchmarks against one peer. Called from a thread.
 
-    Returns (results_dict, max_lock_wait_ms, benchmark_durations_list).
+    Returns (results_list, max_lock_wait_ms, benchmark_durations_list).
     """
     metas = peer_metas.get(pod_name)
     if metas is None:
-        return {}, 0.0, []
+        return [], 0.0, []
 
     peer_idx = pod_name.rsplit("-", 1)[1]
     work_items = [
@@ -1618,8 +1677,8 @@ def _run_one_poll_round():
     has_errors = any(any(tag in b["value"] for tag in _error_tags)
                      for b in results)
     if not has_errors and FATAL_CUDA_ERROR is not None:
-        log.info("LIVENESS FLIP failing→healthy: round completed without "
-                 "errors, clearing FATAL_CUDA_ERROR (was: %s)", FATAL_CUDA_ERROR)
+        log.info("round completed without errors, clearing FATAL_CUDA_ERROR "
+                 "(was: %s)", FATAL_CUDA_ERROR)
         FATAL_CUDA_ERROR = None
 
     LAST_RESULT_TIME = time.monotonic()
@@ -1685,8 +1744,6 @@ def _wait_until(deadline):
 def start_peer_poll_thread():
     t = threading.Thread(target=peer_poll_loop, daemon=True)
     t.start()
-
-
 
 
 class HTTPHandler(BaseHTTPRequestHandler):
@@ -1907,8 +1964,6 @@ def run_httpd_in_thread():
     t.start()
 
 
-
-
 def log_imex_state():
     try:
         log.info(
@@ -1932,7 +1987,7 @@ def log_device_properties():
 
     for gpu_idx in range(GPUS_PER_NODE):
         ensure_cuda_context(gpu_idx)
-        props = checkCudaErrors(runtime.cudaGetDeviceProperties(gpu_idx))
+        props = cucheck(runtime.cudaGetDeviceProperties(gpu_idx))
 
         printprops = {}
         for k in dir(props):
@@ -1949,82 +2004,6 @@ def log_device_properties():
 
         log.info("GPU %d properties:\n%s", gpu_idx, pformat(printprops))
         pop_cuda_context()
-
-
-
-
-class AtackError(Exception):
-    """Base exception for atack application errors."""
-    pass
-
-
-class CudaError(AtackError):
-    """Raised by checkCudaErrors() for CUDA API failures."""
-    pass
-
-
-class LockError(AtackError):
-    """Raised when GPU lock acquisition fails (timeout, connection error)."""
-    pass
-
-
-class PeerUnreachableError(AtackError):
-    """Raised when a peer pod cannot be reached (DNS failure, connection refused).
-    The caller should skip all remaining GPU pairs for this peer."""
-    pass
-
-
-def _cudaGetErrorEnum(error):
-    if isinstance(error, driver.CUresult):
-        err, name = driver.cuGetErrorName(error)
-        return name if err == driver.CUresult.CUDA_SUCCESS else "<unknown>"
-    elif isinstance(error, nvrtc.nvrtcResult):
-        return nvrtc.nvrtcGetErrorString(error)[1]
-    else:
-        raise RuntimeError("Unknown error type: {}".format(error))
-
-
-def checkCudaErrors(result):
-    """Unwrap a CUDA driver API result tuple.
-
-    Raises CudaError if the status code indicates failure. On success,
-    returns the payload (single value or tuple of values), or None if
-    the result contains only the status code.
-    """
-    global FATAL_CUDA_ERROR
-    if result[0].value:
-        error_name = _cudaGetErrorEnum(result[0])
-        error_msg = "CUDA error code={}({})".format(result[0].value, error_name)
-
-        # CUDA_ERROR_ILLEGAL_STATE (code 401) indicates unrecoverable GPU
-        # state corruption. Flag it so /healthz fails the liveness probe,
-        # causing kubelet to replace this pod with a fresh one (new IMEX
-        # daemon resource claims).
-        # Fatal CUDA errors that indicate unrecoverable GPU/context
-        # corruption. These trigger the liveness probe to fail.
-        # - ILLEGAL_STATE: IMEX/driver state corruption.
-        # - LAUNCH_FAILED: a previous async operation failed, context
-        #   is likely corrupted — next call will be ILLEGAL_STATE.
-        _FATAL_CUDA_CODES = (
-            driver.CUresult.CUDA_ERROR_ILLEGAL_STATE,
-            driver.CUresult.CUDA_ERROR_LAUNCH_FAILED,
-        )
-        if result[0] in _FATAL_CUDA_CODES:
-            was_healthy = FATAL_CUDA_ERROR is None
-            FATAL_CUDA_ERROR = error_msg
-            if was_healthy:
-                log.error("LIVENESS FLIP healthy→failing: %s — "
-                          "/healthz will return 500", error_msg)
-            else:
-                log.error("LIVENESS still failing: %s", error_msg)
-
-        raise CudaError(error_msg)
-    if len(result) == 1:
-        return None
-    elif len(result) == 2:
-        return result[1]
-    else:
-        return result[1:]
 
 
 if __name__ == "__main__":
