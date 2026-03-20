@@ -1,4 +1,4 @@
-REV := $(shell git rev-parse --short=7 HEAD)
+REV := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo "unknown")
 IMAGE := docker.io/jgehrcke/atack:$(REV)
 
 .PHONY: build build-and-push build-and-push-as-latest dashboard scale-up scale-down clean
