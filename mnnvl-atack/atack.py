@@ -70,6 +70,28 @@ Graceful shutdown (SIGTERM/SIGINT):
      via atexit as a safety net.
   5. A hard-exit watchdog thread kills the process after 10s if atexit
      cleanup hangs (e.g. a CUDA driver call blocks indefinitely).
+
+Why lock at all -- tradeoffs:
+
+  Without locking, benchmarks run freely in parallel and round times
+  are shorter. But concurrent DtoD transfers sharing the same GPU's
+  HBM split the available bandwidth, so the measured values are lower
+  and vary depending on how many transfers overlap. The numbers are
+  still valid (they reflect real contention), but they don't tell you
+  the peak per-link bandwidth, which is what we want for hardware
+  validation.
+
+  With locking, each transfer gets exclusive HBM access on both
+  endpoints, so the measurement reflects the actual NVLink link
+  capacity. The cost is serialization: transfers to/from the same GPU
+  wait for each other, which increases round time. The lock machinery
+  adds complexity (ordering, tokens, watchdog, HTTP round-trips for
+  remote locks). Locking also makes graceful shutdown more involved:
+  we must drain in-flight locks before freeing GPU memory. That said,
+  even without locking we would need coordinated shutdown -- a peer
+  might be mid-DtoD from our memory when we exit, and freeing that
+  memory without coordination causes CUDA errors or SIGSEGV on the
+  remote side.
 """
 
 import atexit
