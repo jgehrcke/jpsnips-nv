@@ -932,48 +932,53 @@ def _refresh_shared_chunk_for_gpu(gpu_idx):
             log.info("GPU %d: retired old chunk (never served)", gpu_idx)
 
 
+def _refresh_one_gpu(gpu_idx):
+    """Refresh the shared chunk on one GPU. Returns True on ILLEGAL_STATE."""
+    t0 = time.monotonic()
+    ensure_cuda_context(gpu_idx)
+    try:
+        _refresh_shared_chunk_for_gpu(gpu_idx)
+        elapsed_s = time.monotonic() - t0
+        if elapsed_s > 1:
+            log.warning("refreshed shared chunk on GPU %d in %.1fs (slow!)",
+                        gpu_idx, elapsed_s)
+        else:
+            log.info("refreshed shared chunk on GPU %d in %.0f ms",
+                     gpu_idx, elapsed_s * 1000)
+        return False
+    except CudaError as exc:
+        elapsed_s = time.monotonic() - t0
+        log.exception("failed to refresh shared chunk on GPU %d "
+                      "(after %.1fs):", gpu_idx, elapsed_s)
+        if "ILLEGAL_STATE" in str(exc):
+            log.warning("ILLEGAL_STATE during refresh, skipping "
+                        "remaining GPUs this cycle")
+            return True
+        return False
+    except Exception:
+        elapsed_s = time.monotonic() - t0
+        log.exception("failed to refresh shared chunk on GPU %d "
+                      "(after %.1fs):", gpu_idx, elapsed_s)
+        return False
+    finally:
+        pop_cuda_context()
+
+
 def chunk_refresh_loop():
     """Periodically replace shared chunks with fresh allocations on all GPUs.
 
     This exercises the full CUDA allocation + IMEX export path regularly,
-    rather than relying on memory allocated once at startup. May help
-    detect or recover from degraded IMEX daemon state.
+    rather than relying on memory allocated once at startup.
     """
     while not SHUTTING_DOWN.is_set():
         SHUTTING_DOWN.wait(CHUNK_REFRESH_INTERVAL_S)
         if SHUTTING_DOWN.is_set():
             break
-        fatal_seen = False
         for gpu_idx in range(GPUS_PER_NODE):
-            if fatal_seen:
-                log.warning("skipping GPU %d refresh (ILLEGAL_STATE on earlier GPU)",
-                            gpu_idx)
-                continue
-            t0 = time.monotonic()
-            ensure_cuda_context(gpu_idx)
-            try:
-                _refresh_shared_chunk_for_gpu(gpu_idx)
-                elapsed_s = time.monotonic() - t0
-                if elapsed_s > 1:
-                    log.warning("refreshed shared chunk on GPU %d in %.1fs (slow!)",
-                                gpu_idx, elapsed_s)
-                else:
-                    log.info("refreshed shared chunk on GPU %d in %.0f ms",
-                             gpu_idx, elapsed_s * 1000)
-            except CudaError as exc:
-                elapsed_s = time.monotonic() - t0
-                log.exception("failed to refresh shared chunk on GPU %d "
-                              "(after %.1fs):", gpu_idx, elapsed_s)
-                if "ILLEGAL_STATE" in str(exc):
-                    fatal_seen = True
-                    log.warning("ILLEGAL_STATE during refresh — skipping "
-                                "remaining GPUs this cycle")
-            except Exception:
-                elapsed_s = time.monotonic() - t0
-                log.exception("failed to refresh shared chunk on GPU %d "
-                              "(after %.1fs):", gpu_idx, elapsed_s)
-            finally:
-                pop_cuda_context()
+            # abort: ILLEGAL_STATE seen, skip remaining GPUs this cycle.
+            abort = _refresh_one_gpu(gpu_idx)
+            if abort:
+                break
 
 
 def _prepare_shared_chunk_for_gpu(gpu_idx):
