@@ -107,7 +107,7 @@ spec:
             port: 1337
           periodSeconds: 3
           timeoutSeconds: 1
-          failureThreshold: 5
+          failureThreshold: 3
         resources:
           limits:
             nvidia.com/gpu: ${GPUS_PER_NODE}
