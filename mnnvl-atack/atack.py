@@ -742,11 +742,11 @@ def _broadcast_evict_to_peers():
     Called during graceful shutdown, after all in-flight benchmarks have
     completed (local locks drained). Each peer is contacted in parallel
     with a 20s budget (15s first attempt + remaining for retry). The
-    evict-peer endpoint is idempotent — retries are safe. When a peer
+    evict-peer endpoint is idempotent -- retries are safe. When a peer
     confirms (HTTP 200), it has unmapped all our fabric handles.
 
-    Peers that don't respond in time may hit CUDA_ERROR_ILLEGAL_STATE
-    when our IMEX daemon tears down.
+    Peers that don't respond keep holding stale references to our
+    GPU memory, which become invalid once our process exits.
     """
     log.info("shutdown: broadcasting evict-peer to all peers")
     try:
@@ -887,10 +887,17 @@ def _free_retired_chunks(gpu_idx):
 def _refresh_shared_chunk_for_gpu(gpu_idx):
     """Replace the shared chunk on one GPU with a fresh allocation.
 
-    The allocation + fill happens WITHOUT the GPU lock so a slow
-    cuMemCreate or cuMemsetD32 can't block benchmarks. The lock is held
-    only for the atomic pointer swap of the alloc handle (<1ms).
-    The old allocation is retired and freed after CHUNK_RETIRE_S seconds.
+    The allocation + fill happens without holding the GPU lock.
+    _prepare_shared_chunk_for_gpu writes to SHARED_CHUNK_ALLOCS,
+    SHARED_CHUNK_ALLOC_HANDLES, and SHARED_CHUNK_STATIC_META. In CPython,
+    dict mutations are thread-safe, so concurrent reads from the HTTP
+    handler see consistent values.
+
+    The old allocation is not freed immediately -- a remote pod may
+    still be mid-DtoD from it. It is retired and freed after
+    CHUNK_RETIRE_S seconds.
+
+    Also frees any previously retired chunks that have aged out.
 
     Precondition: the GPU's CUDA context must be pushed.
 
@@ -906,8 +913,8 @@ def _refresh_shared_chunk_for_gpu(gpu_idx):
     # slow part (~1-30ms, sometimes longer) that must not block benchmarks.
     # _prepare_shared_chunk_for_gpu writes to SHARED_CHUNK_ALLOCS,
     # SHARED_CHUNK_ALLOC_HANDLES, and SHARED_CHUNK_STATIC_META.
-    # The HTTP handler reads SHARED_CHUNK_ALLOC_HANDLES — Python's GIL
-    # ensures the dict assignment is atomic.
+    # The HTTP handler reads SHARED_CHUNK_ALLOC_HANDLES concurrently;
+    # CPython dict mutations are thread-safe.
     _prepare_shared_chunk_for_gpu(gpu_idx)
 
     # Retire the old allocation.
@@ -1032,11 +1039,17 @@ def _prepare_shared_chunk_for_gpu(gpu_idx):
 
 
 def export_fabric_handle_for_gpu(gpu_idx) -> bytes:
-    """Export a fresh CU_MEM_HANDLE_TYPE_FABRIC handle and return the
-    complete chunk metadata as JSON bytes.
+    """Export a CU_MEM_HANDLE_TYPE_FABRIC handle for SHARED_CHUNK_ALLOC_HANDLES[gpu_idx].
 
-    Called on every /prepare-chunk request. Re-exporting the handle each
-    time (rather than caching it) may help detect stale IMEX daemon state.
+    Called on every /prepare-chunk request. The returned JSON contains
+    the base64-encoded handle plus all fields from SHARED_CHUNK_STATIC_META
+    (pod_name, node_name, gpu_index, num_floats, float_value, alloc_size).
+
+    The underlying allocation changes periodically (chunk_refresh_loop).
+    Between refreshes, the same allocation is re-exported and
+    cuMemExportToShareableHandle returns identical handle bytes.
+    Re-exporting on every request exercises the IMEX daemon code path.
+
     Logs a warning if the export takes longer than 10 ms.
 
     Precondition: the GPU's CUDA context must be pushed.
@@ -1172,21 +1185,21 @@ def map_imported_chunk(alloc_handle, alloc_size: int, gpu_idx: int) -> int:
 
 def verify_chunk_on_gpu(local_gpu_idx: int, va_ptr: int, alloc_size: int,
                         num_floats: int, expected_value: float) -> tuple[str, float]:
-    """Measure NVLink bandwidth and verify data integrity for a mapped chunk.
+    """Copy remote-mapped chunk to local buffer via DtoD, measure bandwidth, verify data.
 
-    Phase 1 — cuMemcpyDtoD from the remote-mapped VA to a pre-allocated
-    local buffer. Timed via CUDA events. This is a pure DMA copy engine
-    transfer with no SM involvement, yielding a clean NVLink bandwidth
-    measurement.
+    Phase 1: cuMemcpyDtoD from remote-mapped VA to pre-allocated local
+    buffer, timed with CUDA events.
 
-    Phase 2 — Checksum kernel on the local copy. Verifies data integrity
-    without affecting the bandwidth measurement (local memory read only).
+    Phase 2: checksum kernel sums all float32 values in the local copy,
+    compares against expected_value * num_floats with relative tolerance
+    CHECKSUM_REL_TOLERANCE. This runs after the timed copy so it does
+    not affect the bandwidth measurement.
 
     Precondition: CUDA context for local_gpu_idx must be pushed.
 
     Returns:
-        (result_str, elapsed_ms): Bandwidth string like '818.5 GB/s' or a
-        CHECKSUM MISMATCH description, plus the raw DtoD transfer time.
+        (result_str, elapsed_ms): '{bw} GB/s' on success, or
+        'CHECKSUM MISMATCH: ...' on verification failure.
 
     Raises:
         CudaError: On any CUDA operation failure.
@@ -1387,17 +1400,21 @@ def _evict_stale_cache_entries(active_handle_bytes):
 
 def import_map_and_verify(peer_host, port, remote_gpu_idx, local_gpu_idx,
                           handle_bytes, alloc_size, num_floats, float_value):
-    """Import a remote fabric handle, map it locally, benchmark, and clean up.
+    """Import a remote fabric handle, map it, acquire GPU locks, run benchmark.
 
-    Manages CUDA context push/pop, lock acquire/release, and VA
-    unmap/release internally. Caller must not hold any GPU locks.
+    Uses the import cache (_get_cached_import) so repeated calls with the
+    same handle_bytes skip the expensive import+map. On any error, the
+    cache entry for this handle is evicted (the handle may be stale).
+
+    Manages CUDA context push/pop and lock acquire/release internally.
+    Caller must not hold any GPU locks.
 
     Returns:
         (result_str, lock_wait_ms, benchmark_ms).
 
     Raises:
         CudaError: On import, mapping, or benchmark failure.
-        RuntimeError: On lock acquisition failure.
+        LockError: On lock acquisition failure.
     """
     peer_name = peer_host.split(".")[0]
     t_total = time.monotonic()
@@ -1533,7 +1550,12 @@ def _prefetch_peer_chunk_metas(peer_name, peer_host, port):
 def _benchmark_one_peer(pod_name, peer_host, port, peer_metas):
     """Run all GPU-pair benchmarks against one peer. Called from a thread.
 
+    Benchmarks all (remote_gpu, local_gpu) pairs in randomized order
+    to reduce lock contention. Stops early if SHUTTING_DOWN is set.
+
     Returns (results_list, max_lock_wait_ms, benchmark_durations_list).
+    Each result is a dict with peer_idx, peer_node, remote_gpu,
+    local_gpu, value.
     """
     metas = peer_metas.get(pod_name)
     if metas is None:
@@ -1733,7 +1755,7 @@ def peer_poll_loop():
 
 
 def _wait_until(deadline):
-    """Busy-wait until the given monotonic-clock deadline (10ms resolution)."""
+    """Sleep until the given monotonic-clock deadline (~10ms resolution)."""
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
