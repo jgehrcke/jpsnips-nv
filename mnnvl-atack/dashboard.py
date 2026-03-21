@@ -22,6 +22,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import termios
@@ -475,25 +476,50 @@ def build_pods_table(atack_pods):
                  border_style="blue", padding=(0, 1))
 
 
-def build_cd_table(cd_daemons):
+def build_cd_table(cd_daemons, cd_log_state):
     table = Table(show_header=True, header_style="bold dim", box=None,
                   pad_edge=False, show_edge=False, padding=(0, 1))
     table.add_column("Pod")
     table.add_column("Node")
     table.add_column("Age")
     table.add_column("Status")
+    table.add_column("DNS Name")
+    table.add_column("NID")
+    table.add_column("Last Error")
+
+    now = datetime.datetime.now(datetime.timezone.utc)
 
     for d in cd_daemons:
         color = status_color(d["status"])
+        log_info = cd_log_state.get(d["name"], {})
+        dns_name = log_info.get("dns_name", "")
+        if dns_name.startswith("compute-domain-daemon-"):
+            dns_name = "\u2026-" + dns_name[len("compute-domain-daemon-"):]
+
+        err_text = Text("")
+        last_error = log_info.get("last_error")
+        if last_error:
+            err_ts = log_info.get("last_error_time")
+            if err_ts:
+                age_s = int((now - err_ts).total_seconds())
+                err_style = "red" if age_s < 30 else "dim"
+                err_text = Text(f"{last_error} ({age_s}s ago)",
+                                style=err_style)
+            else:
+                err_text = Text(last_error, style="red")
+
         table.add_row(
             d["display_name"],
             d["node"],
             d.get("age", ""),
             Text(d["status"], style=color),
+            dns_name,
+            log_info.get("node_id", ""),
+            err_text,
         )
 
     if not cd_daemons:
-        table.add_row("—", "none found", "", "")
+        table.add_row("—", "none found", "", "", "", "", "")
 
     return Panel(table, title="ComputeDomain Daemon Pods (IMEX Daemons)", title_align="left",
                  border_style="blue", padding=(0, 1))
@@ -623,7 +649,7 @@ def build_header():
 
 def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
                  live_matrix_keys, matrix_timestamp, detected_poll_s,
-                 matrix_cell_times, sts_info):
+                 matrix_cell_times, sts_info, cd_log_state):
     mid_row_h = max(len(cd_daemons), len(cd_status["nodes"]), 1) + 4
 
     layout = Layout()
@@ -636,10 +662,10 @@ def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
     layout["header"].update(build_header())
     layout["pods"].update(build_pods_table(atack_pods))
     layout["mid"].split_row(
-        Layout(name="cd_daemons"),
-        Layout(name="cd_status"),
+        Layout(name="cd_daemons", ratio=7),
+        Layout(name="cd_status", ratio=3),
     )
-    layout["cd_daemons"].update(build_cd_table(cd_daemons))
+    layout["cd_daemons"].update(build_cd_table(cd_daemons, cd_log_state))
     layout["cd_status"].update(build_cd_status_panel(cd_status))
     layout["matrix"].update(
         build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
@@ -777,6 +803,169 @@ def pods_poller(state, poll_s, linger_s):
 def cd_daemons_poller(state, poll_s, linger_s):
     """Polls ComputeDomain daemon pods."""
     _linger_loop(get_cd_daemons, state, "daemons", poll_s, linger_s)
+
+
+# Pattern: "Identified this node as ID 2, using bind address of 'compute-domain-daemon-0002'"
+_CD_NODE_ID_RE = re.compile(
+    r"Identified this node as ID (\d+), using bind address of '([^']+)'"
+)
+
+# Timestamp at start of IMEX log lines: "[Mar 21 2026 21:27:56]"
+_CD_LOG_TS_RE = re.compile(
+    r"^\[(\w+ \d+ \d+ \d+:\d+:\d+)\]"
+)
+
+# IMEX daemon error/warning progression for a stuck unimport:
+#
+# 1. "Undelivered messages detected" (WARNING, every 5s) — persistent
+#    heartbeat while a message is stuck in the queue. Has no timeout;
+#    repeats indefinitely until a node disconnect event triggers cleanup
+#    and purges the queue. Not shown in the dashboard — too noisy.
+# 2. "Response not received for unimport event with id XXXX" (WARNING,
+#    every ~10s) — retry attempts for the same event ID. Shown in the
+#    dashboard as the earliest signal that something is wrong.
+# 3. "failed to receive response for unimport event id XXXX" (ERROR,
+#    once) — emitted when retries are exhausted (~50s after first retry).
+
+_CD_UNIMPORT_ERR_RE = re.compile(
+    r"failed to receive response for unimport event id (\d+)"
+)
+
+_CD_UNIMPORT_WARN_RE = re.compile(
+    r"Response not received for unimport event with id (\d+)"
+)
+
+
+def _parse_cd_log_timestamp(line):
+    """Parse timestamp from an IMEX daemon log line. Returns datetime or None."""
+    m = _CD_LOG_TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        return datetime.datetime.strptime(
+            m.group(1), "%b %d %Y %H:%M:%S"
+        ).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+
+
+def _cd_log_follower(pod_name, cd_log_state, stop_event):
+    """Follow kubectl logs for one CD daemon pod, parse node ID, DNS name, errors.
+
+    Runs kubectl logs -f as a subprocess, reads stdout lines, updates
+    cd_log_state[pod_name] with the most recent match. Re-attaches
+    on EOF or error with exponential backoff (1s to 30s).
+    """
+    backoff = 1.0
+    while not stop_event.is_set():
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                ["kubectl", "logs", "-f", "-n", "nvidia-dra-driver-gpu",
+                 pod_name],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            dlog.info("cd_log_follower: attached to %s (pid %d)",
+                      pod_name, proc.pid)
+            backoff = 1.0
+            while True:
+                raw_line = proc.stdout.readline()
+                if not raw_line:
+                    break
+                if stop_event.is_set():
+                    break
+                line = raw_line.decode("utf-8", errors="replace")
+                m = _CD_NODE_ID_RE.search(line)
+                if m:
+                    entry = cd_log_state.get(pod_name, {})
+                    entry["node_id"] = m.group(1)
+                    entry["dns_name"] = m.group(2)
+                    cd_log_state[pod_name] = entry
+
+                if "[ERROR]" in line and "Node disconnect" not in line:
+                    ts = _parse_cd_log_timestamp(line)
+                    em = _CD_UNIMPORT_ERR_RE.search(line)
+                    if em:
+                        err_msg = f"unimport id {em.group(1)}: no response"
+                    else:
+                        # Unknown error type — show the message after "[tid N] ".
+                        parts = line.split("] ", 3)
+                        err_msg = parts[3].strip() if len(parts) >= 4 else line.strip()
+                        if len(err_msg) > 60:
+                            err_msg = err_msg[:57] + "..."
+                    entry = cd_log_state.get(pod_name, {})
+                    entry["last_error"] = err_msg
+                    entry["last_error_time"] = ts
+                    cd_log_state[pod_name] = entry
+
+                elif "[WARNING]" in line:
+                    wm = _CD_UNIMPORT_WARN_RE.search(line)
+                    if wm:
+                        ts = _parse_cd_log_timestamp(line)
+                        entry = cd_log_state.get(pod_name, {})
+                        prev_ts = entry.get("last_error_time")
+                        if prev_ts is None or (ts is not None and ts >= prev_ts):
+                            entry["last_error"] = f"unimport id {wm.group(1)}: no response"
+                            entry["last_error_time"] = ts
+                            cd_log_state[pod_name] = entry
+            proc.wait(timeout=5)
+            if proc.returncode != 0:
+                stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
+                dlog.warning("cd_log_follower: %s exited %d: %s",
+                             pod_name, proc.returncode, stderr)
+            else:
+                dlog.info("cd_log_follower: %s log stream ended", pod_name)
+        except Exception as exc:
+            dlog.warning("cd_log_follower: %s error: %s", pod_name, exc)
+        finally:
+            if proc:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+
+        if stop_event.is_set():
+            break
+        stop_event.wait(backoff)
+        backoff = min(backoff * 2, 30.0)
+
+
+def cd_log_follower_spawner(cd_daemon_state, cd_log_state):
+    """Spawns one log-follower thread per CD daemon pod.
+
+    Watches cd_daemon_state.daemons for new/removed pods. Starts a
+    _cd_log_follower thread for each new pod, stops threads for pods
+    that disappear.
+    """
+    active = {}  # {pod_name: (Thread, stop_event)}
+    while True:
+        daemons = cd_daemon_state.daemons
+        live_names = set(d["name"] for d in daemons
+                         if d.get("status") != "Terminated")
+
+        for name in live_names:
+            if name in active:
+                continue
+            stop = threading.Event()
+            t = threading.Thread(
+                target=_cd_log_follower,
+                args=(name, cd_log_state, stop),
+                daemon=True,
+            )
+            t.start()
+            active[name] = (t, stop)
+            dlog.info("cd_log_follower_spawner: started follower for %s", name)
+
+        for name in list(active):
+            if name not in live_names:
+                _, stop = active.pop(name)
+                stop.set()
+                cd_log_state.pop(name, None)
+                dlog.info("cd_log_follower_spawner: stopped follower for %s",
+                          name)
+
+        time.sleep(2.0)
 
 
 def _fetch_pod_results(node_ip):
@@ -946,6 +1135,7 @@ def main():
     pods_state = PanelState(pods=[], live_pod_indices=set(),
                             sts_info=None)
     cd_daemon_state = PanelState(daemons=[])
+    cd_log_state = {}  # {pod_name: {"node_id": str, "dns_name": str}}
     cd_status_state = PanelState(status={"overall": "?", "nodes": []})
     results_state = PanelState(
         matrix={},            # {row_key: {col_key: value_str}}
@@ -964,6 +1154,11 @@ def main():
     threading.Thread(
         target=cd_daemons_poller,
         args=(cd_daemon_state, CD_POLL_INTERVAL_S, LINGER_S),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=cd_log_follower_spawner,
+        args=(cd_daemon_state, cd_log_state),
         daemon=True,
     ).start()
     threading.Thread(
@@ -1055,7 +1250,7 @@ def main():
                     display_pods, cd_daemon_state.daemons,
                     cd_status_state.status, latest_matrix, pod_nodes,
                     live_matrix_keys, matrix_timestamp, detected_poll_s,
-                    matrix_cell_times, sts_info))
+                    matrix_cell_times, sts_info, cd_log_state))
 
                 time.sleep(1.0 / REFRESH_HZ)
 
