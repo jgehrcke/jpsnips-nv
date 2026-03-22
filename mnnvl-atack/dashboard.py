@@ -485,6 +485,9 @@ def build_cd_table(cd_daemons, cd_log_state):
     table.add_column("Status")
     table.add_column("DNS Name")
     table.add_column("NID")
+    table.add_column("Crashes")
+    table.add_column("A")
+    table.add_column("D")
     table.add_column("Last Error")
 
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -503,10 +506,23 @@ def build_cd_table(cd_daemons, cd_log_state):
             if err_ts:
                 age_s = int((now - err_ts).total_seconds())
                 err_style = "red" if age_s < 30 else "dim"
-                err_text = Text(f"{last_error} ({age_s}s ago)",
+                if age_s >= 3600:
+                    age_str = f"{age_s / 3600:.1f}h ago"
+                elif age_s >= 300:
+                    age_str = f"{age_s // 60}min ago"
+                else:
+                    age_str = f"{age_s}s ago"
+                err_text = Text(f"{last_error} ({age_str})",
                                 style=err_style)
             else:
                 err_text = Text(last_error, style="red")
+
+        imex_crashes = log_info.get("imex_crashes", 0)
+        crashes_text = Text(str(imex_crashes),
+                            style="red" if imex_crashes > 0 else "")
+
+        attach_count = log_info.get("attach_count", 0)
+        detach_count = log_info.get("detach_count", 0)
 
         table.add_row(
             d["display_name"],
@@ -515,11 +531,14 @@ def build_cd_table(cd_daemons, cd_log_state):
             Text(d["status"], style=color),
             dns_name,
             log_info.get("node_id", ""),
+            crashes_text,
+            str(attach_count),
+            str(detach_count),
             err_text,
         )
 
     if not cd_daemons:
-        table.add_row("—", "none found", "", "", "", "", "")
+        table.add_row("—", "none found", "", "", "", "", "", "", "", "")
 
     return Panel(table, title="ComputeDomain Daemon Pods (IMEX Daemons)", title_align="left",
                  border_style="blue", padding=(0, 1))
@@ -827,6 +846,10 @@ _CD_LOG_TS_RE = re.compile(
 # 3. "failed to receive response for unimport event id XXXX" (ERROR,
 #    once) — emitted when retries are exhausted (~50s after first retry).
 
+_CD_PROCESS_START_RE = re.compile(
+    r"process\.go:\d+\] Started process with pid (\d+)"
+)
+
 _CD_UNIMPORT_ERR_RE = re.compile(
     r"failed to receive response for unimport event id (\d+)"
 )
@@ -868,6 +891,8 @@ def _cd_log_follower(pod_name, cd_log_state, stop_event):
             dlog.info("cd_log_follower: attached to %s (pid %d)",
                       pod_name, proc.pid)
             backoff = 1.0
+            process_start_count = 0
+            saw_log_start = False
             while True:
                 raw_line = proc.stdout.readline()
                 if not raw_line:
@@ -875,11 +900,46 @@ def _cd_log_follower(pod_name, cd_log_state, stop_event):
                 if stop_event.is_set():
                     break
                 line = raw_line.decode("utf-8", errors="replace")
+
+                if "Started debug signal handler" in line:
+                    saw_log_start = True
+
+                # Detect IMEX daemon (re)start — clear state from
+                # the previous daemon process.
+                if _CD_PROCESS_START_RE.search(line):
+                    process_start_count += 1
+                    dlog.info("cd_log_follower: %s: IMEX process started "
+                              "(start_count=%d, saw_log_start=%s), "
+                              "clearing state",
+                              pod_name, process_start_count,
+                              saw_log_start)
+                    cd_log_state.pop(pod_name, None)
+                    # If we saw the CD daemon startup line we have the
+                    # full log and the first process start is the
+                    # initial boot, not a crash. Otherwise every start
+                    # we see indicates a crash of the previous process.
+                    if saw_log_start:
+                        crashes = process_start_count - 1
+                    else:
+                        crashes = process_start_count
+                    entry = cd_log_state.get(pod_name, {})
+                    entry["imex_crashes"] = crashes
+                    cd_log_state[pod_name] = entry
+
                 m = _CD_NODE_ID_RE.search(line)
                 if m:
                     entry = cd_log_state.get(pod_name, {})
                     entry["node_id"] = m.group(1)
                     entry["dns_name"] = m.group(2)
+                    cd_log_state[pod_name] = entry
+
+                if "Attaching to GPU " in line:
+                    entry = cd_log_state.get(pod_name, {})
+                    entry["attach_count"] = entry.get("attach_count", 0) + 1
+                    cd_log_state[pod_name] = entry
+                elif "Detaching from GPU id:" in line:
+                    entry = cd_log_state.get(pod_name, {})
+                    entry["detach_count"] = entry.get("detach_count", 0) + 1
                     cd_log_state[pod_name] = entry
 
                 if "[ERROR]" in line and "Node disconnect" not in line:
