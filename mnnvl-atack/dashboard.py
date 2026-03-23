@@ -428,15 +428,15 @@ def status_color(status):
 def build_pods_table(atack_pods):
     table = Table(show_header=True, header_style="bold dim", box=None,
                   pad_edge=False, show_edge=False, padding=(0, 1))
-    table.add_column("#", style="bold", width=3)
-    table.add_column("Pod")
-    table.add_column("Node")
-    table.add_column("Age", min_width=6)
-    table.add_column("Status", min_width=17)
-    table.add_column("Restarts")
-    table.add_column("Direct Liveness Probe")
-    table.add_column("LP Fail Event")
-    table.add_column("Last Result")
+    table.add_column("#", style="bold", width=3, no_wrap=True)
+    table.add_column("Pod", no_wrap=True)
+    table.add_column("Node", no_wrap=True)
+    table.add_column("Age", min_width=6, no_wrap=True)
+    table.add_column("Status", min_width=17, no_wrap=True)
+    table.add_column("Restarts", no_wrap=True)
+    table.add_column("Direct Liveness Probe", no_wrap=True)
+    table.add_column("LP Fail Event", no_wrap=True)
+    table.add_column("Last Result", no_wrap=True)
     for p in atack_pods:
         color = status_color(p["status"])
         probe = p.get("direct_probe", "")
@@ -479,16 +479,16 @@ def build_pods_table(atack_pods):
 def build_cd_table(cd_daemons, cd_log_state):
     table = Table(show_header=True, header_style="bold dim", box=None,
                   pad_edge=False, show_edge=False, padding=(0, 1))
-    table.add_column("Pod")
-    table.add_column("Node")
-    table.add_column("Age")
-    table.add_column("Status")
-    table.add_column("DNS Name")
-    table.add_column("NID")
-    table.add_column("Crashes")
-    table.add_column("A")
-    table.add_column("D")
-    table.add_column("Last Error")
+    table.add_column("Pod", no_wrap=True)
+    table.add_column("Node", no_wrap=True)
+    table.add_column("Age", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("DNS Name", no_wrap=True)
+    table.add_column("NID", no_wrap=True)
+    table.add_column("Crsh", no_wrap=True)
+    table.add_column("A", no_wrap=True)
+    table.add_column("D", no_wrap=True)
+    table.add_column("Last Error", no_wrap=True)
 
     now = datetime.datetime.now(datetime.timezone.utc)
 
@@ -547,22 +547,36 @@ def build_cd_table(cd_daemons, cd_log_state):
 def build_cd_status_panel(cd_status):
     table = Table(show_header=True, header_style="bold dim", box=None,
                   pad_edge=False, show_edge=False, padding=(0, 1))
-    table.add_column("#", width=3)
-    table.add_column("Node")
-    table.add_column("Status")
-    table.add_column("Stale")
+    table.add_column("Node", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("", width=5, no_wrap=True)
+
+    names = [n["name"] for n in cd_status["nodes"]]
+    if len(names) >= 2:
+        prefix = os.path.commonprefix(names)
+        # Only strip up to the last separator to keep a readable suffix.
+        sep = prefix.rfind("-")
+        if sep > 0:
+            prefix = prefix[:sep + 1]
+        else:
+            prefix = ""
+    else:
+        prefix = ""
 
     for n in cd_status["nodes"]:
+        display_name = n["name"][len(prefix):] if prefix else n["name"]
+        if prefix:
+            display_name = "\u2026-" + display_name
         is_stale = n["status"] == "stale"
         color = status_color(n["status"])
         stale_cell = Text("stale", style="red") if is_stale else Text("")
         status_text = Text(n["status"], style=color) if not is_stale else Text("—", style="dim")
-        table.add_row(str(n["index"]), n["name"], status_text, stale_cell)
+        table.add_row(display_name, status_text, stale_cell)
 
     if not cd_status["nodes"]:
-        table.add_row("—", "none", "", "")
+        table.add_row("none", "", "")
 
-    return Panel(table, title="ComputeDomain Status", title_align="left",
+    return Panel(table, title="ComputeDomain Node Status", title_align="left",
                  border_style="blue", padding=(0, 1))
 
 
@@ -681,8 +695,8 @@ def build_layout(atack_pods, cd_daemons, cd_status, latest_matrix, pod_nodes,
     layout["header"].update(build_header())
     layout["pods"].update(build_pods_table(atack_pods))
     layout["mid"].split_row(
-        Layout(name="cd_daemons", ratio=7),
-        Layout(name="cd_status", ratio=3),
+        Layout(name="cd_daemons", ratio=3),
+        Layout(name="cd_status", ratio=1),
     )
     layout["cd_daemons"].update(build_cd_table(cd_daemons, cd_log_state))
     layout["cd_status"].update(build_cd_status_panel(cd_status))
