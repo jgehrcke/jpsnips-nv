@@ -1268,7 +1268,7 @@ def main():
 
     last_heartbeat = 0
 
-    with Live(console=console, refresh_per_second=REFRESH_HZ,
+    with Live(console=console, auto_refresh=False,
               screen=True) as live:
         try:
             while True:
@@ -1332,11 +1332,15 @@ def main():
                         p2["last_result_ago"] = None
                     display_pods.append(p2)
 
-                live.update(build_layout(
-                    display_pods, cd_daemon_state.daemons,
-                    cd_status_state.status, latest_matrix, pod_nodes,
-                    live_matrix_keys, matrix_timestamp, detected_poll_s,
-                    matrix_cell_times, sts_info, cd_log_state))
+                try:
+                    live.update(build_layout(
+                        display_pods, cd_daemon_state.daemons,
+                        cd_status_state.status, latest_matrix, pod_nodes,
+                        live_matrix_keys, matrix_timestamp, detected_poll_s,
+                        matrix_cell_times, sts_info, cd_log_state),
+                        refresh=True)
+                except Exception:
+                    dlog.exception("render failed:")
 
                 time.sleep(1.0 / REFRESH_HZ)
 
