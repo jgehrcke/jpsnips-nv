@@ -428,14 +428,13 @@ def status_color(status):
 def build_pods_table(atack_pods):
     table = Table(show_header=True, header_style="bold dim", box=None,
                   pad_edge=False, show_edge=False, padding=(0, 1))
-    table.add_column("#", style="bold", width=3, no_wrap=True)
     table.add_column("Pod", no_wrap=True)
     table.add_column("Node", no_wrap=True)
     table.add_column("Age", min_width=6, no_wrap=True)
     table.add_column("Status", min_width=17, no_wrap=True)
     table.add_column("Restarts", no_wrap=True)
-    table.add_column("Direct Liveness Probe", no_wrap=True)
-    table.add_column("LP Fail Event", no_wrap=True)
+    table.add_column("Liveness (direct)", no_wrap=True)
+    table.add_column("Liveness (fail event)", no_wrap=True)
     table.add_column("Last Result", no_wrap=True)
     for p in atack_pods:
         color = status_color(p["status"])
@@ -464,13 +463,13 @@ def build_pods_table(atack_pods):
             liveness = Text("")
         restarts = p.get("restart_count", 0)
         restarts_text = Text(str(restarts), style="red" if restarts > 0 else "")
-        table.add_row(p["idx"], p["name"], p["node"], p.get("age", ""),
+        table.add_row(p["name"], p["node"], p.get("age", ""),
                       Text(p["status"], style=color),
                       restarts_text, probe_text, liveness,
                       last_result_text)
 
     if not atack_pods:
-        table.add_row("—", "no pods", "", "", "", "", "", "", "")
+        table.add_row("no pods", "", "", "", "", "", "", "")
 
     return Panel(table, title="Workload Pods", title_align="left",
                  border_style="blue", padding=(0, 1))
@@ -485,9 +484,9 @@ def build_cd_table(cd_daemons, cd_log_state):
     table.add_column("Status", no_wrap=True)
     table.add_column("DNS Name", no_wrap=True)
     table.add_column("NID", no_wrap=True)
-    table.add_column("Crsh", no_wrap=True)
-    table.add_column("A", no_wrap=True)
-    table.add_column("D", no_wrap=True)
+    # table.add_column("Crsh", no_wrap=True)
+    table.add_column("A", no_wrap=True, min_width=1)
+    table.add_column("D", no_wrap=True, min_width=1)
     table.add_column("Last Error", no_wrap=True)
 
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -512,14 +511,14 @@ def build_cd_table(cd_daemons, cd_log_state):
                     age_str = f"{age_s // 60}min ago"
                 else:
                     age_str = f"{age_s}s ago"
-                err_text = Text(f"{last_error} ({age_str})",
+                err_text = Text(f"({age_str}) {last_error}",
                                 style=err_style)
             else:
                 err_text = Text(last_error, style="red")
 
-        imex_crashes = log_info.get("imex_crashes", 0)
-        crashes_text = Text(str(imex_crashes),
-                            style="red" if imex_crashes > 0 else "")
+        # imex_crashes = log_info.get("imex_crashes", 0)
+        # crashes_text = Text(str(imex_crashes),
+        #                     style="red" if imex_crashes > 0 else "")
 
         attach_count = log_info.get("attach_count", 0)
         detach_count = log_info.get("detach_count", 0)
@@ -531,14 +530,14 @@ def build_cd_table(cd_daemons, cd_log_state):
             Text(d["status"], style=color),
             dns_name,
             log_info.get("node_id", ""),
-            crashes_text,
+            # crashes_text,
             str(attach_count),
             str(detach_count),
             err_text,
         )
 
     if not cd_daemons:
-        table.add_row("—", "none found", "", "", "", "", "", "", "", "")
+        table.add_row("—", "none found", "", "", "", "", "", "", "")
 
     return Panel(table, title="ComputeDomain Daemon Pods (IMEX Daemons)", title_align="left",
                  border_style="blue", padding=(0, 1))
@@ -621,11 +620,20 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
     else:
         node_map = {n: shorten_node(n) for n in all_nodes}
 
+    # When each pod maps to a unique node, the pod index is redundant
+    # with the node name — drop it to save space.
+    unique_nodes = set(pod_nodes.get(c.split("-", 1)[0], "?") for c in cols)
+    one_pod_per_node = len(unique_nodes) == len(
+        set(c.split("-", 1)[0] for c in cols))
+
     col_headers = {}
     for c in cols:
         pod_idx, gpu_idx = c.split("-", 1)
         node = node_map.get(pod_nodes.get(pod_idx, "?"), "?")
-        col_headers[c] = f"{pod_idx}-{node}-{gpu_idx}"
+        if one_pod_per_node:
+            col_headers[c] = f"{node}-{gpu_idx}"
+        else:
+            col_headers[c] = f"{pod_idx}-{node}-{gpu_idx}"
 
     # Adapt min column width to matrix size.
     min_col_width = 10 if len(cols) <= 8 else 7
@@ -639,7 +647,10 @@ def build_matrix_panel(latest_matrix, pod_nodes, live_matrix_keys,
     for row_key in cols:
         pod_idx, gpu_idx = row_key.split("-", 1)
         node = node_map.get(pod_nodes.get(pod_idx, "?"), "?")
-        row_label = f"{pod_idx}-{node}-{gpu_idx}"
+        if one_pod_per_node:
+            row_label = f"{node}-{gpu_idx}"
+        else:
+            row_label = f"{pod_idx}-{node}-{gpu_idx}"
         peers = latest_matrix.get(row_key, {})
         row_age = time.monotonic() - matrix_cell_times.get(row_key, 0)
         is_stale = row_age > MATRIX_STALE_S
@@ -956,7 +967,8 @@ def _cd_log_follower(pod_name, cd_log_state, stop_event):
                     entry["detach_count"] = entry.get("detach_count", 0) + 1
                     cd_log_state[pod_name] = entry
 
-                if "[ERROR]" in line and "Node disconnect" not in line:
+                if "[ERROR]" in line and "Node disconnect" not in line \
+                        and "Memory exporter" not in line:
                     ts = _parse_cd_log_timestamp(line)
                     em = _CD_UNIMPORT_ERR_RE.search(line)
                     if em:
@@ -965,8 +977,8 @@ def _cd_log_follower(pod_name, cd_log_state, stop_event):
                         # Unknown error type — show the message after "[tid N] ".
                         parts = line.split("] ", 3)
                         err_msg = parts[3].strip() if len(parts) >= 4 else line.strip()
-                        if len(err_msg) > 60:
-                            err_msg = err_msg[:57] + "..."
+                        if len(err_msg) > 35:
+                            err_msg = err_msg[:32] + "..."
                     entry = cd_log_state.get(pod_name, {})
                     entry["last_error"] = err_msg
                     entry["last_error_time"] = ts
