@@ -14,7 +14,7 @@ WORKDIR /atack
 
 RUN python3.12 -m venv .venv
 ENV PATH="/atack/.venv/bin:${PATH}"
-RUN pip install requests cuda-python[all]==12.9.6 dnspython orjson
+RUN pip install requests cuda-python[all]==12.9.6 dnspython orjson zstandard
 
 COPY ./atack.py /atack
 

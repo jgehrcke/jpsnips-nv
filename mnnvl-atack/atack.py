@@ -119,6 +119,7 @@ from urllib.parse import urlparse, parse_qs
 import dns.resolver
 import orjson
 import requests
+import zstandard
 from requests.adapters import HTTPAdapter
 
 from cuda.bindings import driver, runtime, nvrtc
@@ -205,6 +206,10 @@ def cucheck(result):
 _http_session = requests.Session()
 _http_session.mount("http://", HTTPAdapter(max_retries=0))
 _http_session.mount("https://", HTTPAdapter(max_retries=0))
+
+# zstd compressor for HTTP responses. Level 1: minimal CPU, good ratio on JSON.
+# ZstdCompressor is thread-safe for compress() calls.
+_zstd_cctx = zstandard.ZstdCompressor(level=1)
 
 # Configuration from environment.
 HTTPD_PORT = int(os.environ.get("HTTPD_PORT", "1337"))
@@ -1815,9 +1820,19 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _respond_json(self, body):
-        """Send a 200 JSON response. body must be bytes."""
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        """Send a 200 JSON response. body must be bytes.
+
+        Compresses with zstd if the client sent Accept-Encoding: zstd.
+        """
+        accept = self.headers.get("Accept-Encoding", "")
+        if "zstd" in accept:
+            body = _zstd_cctx.compress(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Encoding", "zstd")
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(body))
         self.end_headers()
         self.wfile.write(body)

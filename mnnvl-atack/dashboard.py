@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["rich"]
+# dependencies = ["rich", "zstandard"]
 # ///
 """
 TUI dashboard for atack — All-to-All CUDA Kubernetes test.
@@ -32,6 +32,8 @@ import traceback
 import tty
 import urllib.error
 import urllib.request
+
+import zstandard
 
 
 # Dashboard diagnostics go to a log file to avoid flickering caused by
@@ -1054,12 +1056,19 @@ def cd_log_follower_spawner(cd_daemon_state, cd_log_state):
         time.sleep(2.0)
 
 
+_zstd_dctx = zstandard.ZstdDecompressor()
+
+
 def _fetch_pod_results(node_ip):
     """Fetch /results from a pod via node IP. Returns parsed JSON or None."""
     try:
         req = urllib.request.Request(f"http://{node_ip}:1337/results")
+        req.add_header("Accept-Encoding", "zstd")
         with urllib.request.urlopen(req, timeout=0.5) as resp:
-            return json.loads(resp.read())
+            data = resp.read()
+            if resp.headers.get("Content-Encoding") == "zstd":
+                data = _zstd_dctx.decompress(data)
+            return json.loads(data)
     except Exception:
         return None
 
