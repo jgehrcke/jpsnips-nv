@@ -216,6 +216,7 @@ GPUS_PER_NODE = int(os.environ.get("GPUS_PER_NODE", "1"))
 K8S_PODNAME = socket.gethostname()
 K8S_NAMESPACE = os.environ.get("POD_NAMESPACE", "default")
 K8S_NODENAME = os.environ.get("NODE_NAME", "unknown")
+DTOD_REPEAT_COUNT = int(os.environ.get("DTOD_REPEAT_COUNT", "2"))
 CHECKSUM_REL_TOLERANCE = 1e-5
 
 # Per-GPU state, keyed by gpu_idx (0..GPUS_PER_NODE-1). Set during cuda_init().
@@ -1239,17 +1240,20 @@ def verify_chunk_on_gpu(local_gpu_idx: int, va_ptr: int, alloc_size: int,
         f"chunk {alloc_size} exceeds pre-allocated buffer {VERIFY_LOCAL_BUF_SIZES[local_gpu_idx]}"
 
     # Phase 1: time the DtoD copy (pure NVLink transfer).
+    # Run DTOD_REPEAT_COUNT iterations, keep the best (lowest) duration.
     ev_start = cucheck(driver.cuEventCreate(0))
     ev_end = cucheck(driver.cuEventCreate(0))
-
-    cucheck(driver.cuEventRecord(ev_start, 0))
-    cucheck(driver.cuMemcpyDtoD(local_buf, va_ptr, alloc_size))
-    cucheck(driver.cuEventRecord(ev_end, 0))
-    cucheck(driver.cuEventSynchronize(ev_end))
-
-    elapsed_ms = cucheck(driver.cuEventElapsedTime(ev_start, ev_end))
+    durations_ms = []
+    for _ in range(DTOD_REPEAT_COUNT):
+        cucheck(driver.cuCtxSynchronize())
+        cucheck(driver.cuEventRecord(ev_start, 0))
+        cucheck(driver.cuMemcpyDtoD(local_buf, va_ptr, alloc_size))
+        cucheck(driver.cuEventRecord(ev_end, 0))
+        cucheck(driver.cuEventSynchronize(ev_end))
+        durations_ms.append(cucheck(driver.cuEventElapsedTime(ev_start, ev_end)))
     cucheck(driver.cuEventDestroy(ev_start))
     cucheck(driver.cuEventDestroy(ev_end))
+    elapsed_ms = min(durations_ms)
 
     # Phase 2: checksum the local copy for data integrity.
     num_blocks = CHECKSUM_NUM_BLOCKS[local_gpu_idx]
